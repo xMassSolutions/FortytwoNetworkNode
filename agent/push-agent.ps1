@@ -152,15 +152,37 @@ if ($DryRun) {
     return
 }
 
-Write-Output "Fortytwo agent starting. Push interval ${IntervalSeconds}s. Bot URL: $BotUrl"
+if ($Once) {
+    Post-Snapshot (Get-NodeSnapshot)
+    return
+}
 
-do {
+Write-Output "Fortytwo agent starting. Mode: event-driven (push on inference round completion). Bot URL: $BotUrl"
+
+# One bootstrap push so the bot has fresh data immediately on agent start
+try {
+    Post-Snapshot (Get-NodeSnapshot)
+} catch {
+    Write-Output ("[bootstrap] " + $_.Exception.Message)
+}
+
+# Tail extended_log.txt and push only when an inference round event lands
+$EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
+while ($true) {
     try {
-        $snap = Get-NodeSnapshot
-        Post-Snapshot $snap
+        Get-Content -Path $ExtLog -Wait -Tail 0 -ErrorAction Stop | ForEach-Object {
+            if ($_ -match $EventPattern) {
+                $now = Get-Date -Format "HH:mm:ss"
+                Write-Output "[$now] inference event - pushing snapshot"
+                try {
+                    Post-Snapshot (Get-NodeSnapshot)
+                } catch {
+                    Write-Output ("[push] " + $_.Exception.Message)
+                }
+            }
+        }
     } catch {
-        Write-Output ("[{0}] snapshot exception: {1}" -f (Get-Date -Format "HH:mm:ss"), $_.Exception.Message)
+        Write-Output ("[tail] " + $_.Exception.Message + " - reopening in 5s")
+        Start-Sleep -Seconds 5
     }
-    if ($Once) { break }
-    Start-Sleep -Seconds $IntervalSeconds
-} while ($true)
+}
