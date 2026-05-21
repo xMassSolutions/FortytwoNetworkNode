@@ -8,8 +8,15 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 import wallets as wstore
 from chain import get_for_balance, get_native_balance
@@ -63,6 +70,26 @@ NON_ADMIN_REDIRECT = (
     "/mywallets — list your subscriptions\n"
     "/help — all commands"
 )
+
+# Persistent reply keyboard shown after /start. Button text is matched to
+# entry handlers below via regex filters.
+BTN_SUBSCRIBE = "💼 Subscribe a wallet"
+BTN_MY_SUBS = "📊 My subscriptions"
+BTN_BALANCE = "💰 Check balance"
+BTN_HELP = "❓ Help"
+
+MAIN_KB = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BTN_SUBSCRIBE), KeyboardButton(BTN_MY_SUBS)],
+        [KeyboardButton(BTN_BALANCE), KeyboardButton(BTN_HELP)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+# Conversation states
+ASK_SUB_ADDR = 1
+ASK_BAL_ADDR = 2
 
 application: Application | None = None
 
@@ -146,31 +173,12 @@ async def cmd_today(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    # With argument: query any wallet (public). Without: operator wallet (admin only).
-    target = None
-    if ctx.args:
-        cand = wstore.normalize_addr(ctx.args[0])
-        if not cand:
-            await update.message.reply_text(
-                "Usage: `/balance 0x<address>`",
-                parse_mode="Markdown",
-            )
-            return
-        target = cand
-    else:
-        if not is_admin(update):
-            await update.message.reply_text(
-                "Specify a wallet: `/balance 0x<address>`",
-                parse_mode="Markdown",
-            )
-            return
-        target = WALLET
+async def _do_balance(update: Update, target: str) -> None:
     try:
         bal = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, target)
     except Exception as e:
         log.exception("balance lookup failed")
-        await update.message.reply_text(f"RPC error: {e}")
+        await update.message.reply_text(f"RPC error: {e}", reply_markup=MAIN_KB)
         return
 
     extra = ""
@@ -186,7 +194,51 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"*FOR balance:* *{fmt_for(bal)}*"
         f"{extra}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KB)
+
+
+async def conv_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for /balance [0x...] OR the 💰 Check balance button."""
+    if ctx.args:
+        cand = wstore.normalize_addr(ctx.args[0])
+        if not cand:
+            await update.message.reply_text(
+                "Invalid address. Try `/balance 0x<address>` or /cancel.",
+                parse_mode="Markdown",
+                reply_markup=MAIN_KB,
+            )
+            return ConversationHandler.END
+        await _do_balance(update, cand)
+        return ConversationHandler.END
+
+    # No args
+    if is_admin(update):
+        await _do_balance(update, WALLET)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Send me the wallet address to check (paste `0x...`), or /cancel.",
+        parse_mode="Markdown",
+    )
+    return ASK_BAL_ADDR
+
+
+async def conv_balance_addr(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    addr = wstore.normalize_addr(text)
+    if not addr:
+        await update.message.reply_text(
+            "Not a valid address. Paste `0x` + 40 hex chars, or /cancel.",
+            parse_mode="Markdown",
+        )
+        return ASK_BAL_ADDR
+    await _do_balance(update, addr)
+    return ConversationHandler.END
+
+
+async def conv_cancel(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Cancelled.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
 
 
 async def cmd_recent(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -240,7 +292,23 @@ async def cmd_myid(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Username:* {('@' + user.username) if user and user.username else '—'}\n\n"
         f"_To gain operator access, add this ID to the bot's `ADMIN_CHAT_IDS` env var._"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KB)
+
+
+async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "👋 *Welcome to FortyTwo Node Bot*\n\n"
+        "Track FOR token rewards on Monad Testnet for any wallet.\n"
+        "Tap a button below to get started:\n\n"
+        f"• {BTN_SUBSCRIBE} — get DM notifications on every FOR reward\n"
+        f"• {BTN_MY_SUBS} — list your subscriptions\n"
+        f"• {BTN_BALANCE} — check any wallet's FOR + MONAD balance\n"
+        f"• {BTN_HELP} — show all commands\n\n"
+        f"_Dashboard:_ {PUBLIC_URL}/dashboard"
+    )
+    await update.message.reply_text(
+        msg, parse_mode="Markdown", reply_markup=MAIN_KB, disable_web_page_preview=True
+    )
 
 
 async def cmd_uptime(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -275,23 +343,51 @@ async def cmd_version(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-async def cmd_subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
+async def conv_subscribe_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for /subscribe [0x...] OR the 💼 Subscribe button."""
+    # If they typed the address inline → process directly, no conversation
+    if ctx.args:
+        try:
+            addr = wstore.subscribe(update.effective_chat.id, ctx.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "Invalid address — must be `0x` + 40 hex chars.",
+                parse_mode="Markdown",
+                reply_markup=MAIN_KB,
+            )
+            return ConversationHandler.END
         await update.message.reply_text(
-            "Usage: `/subscribe 0x<address>`\nYou'll receive a notification "
-            "every time this wallet receives a FOR reward.",
+            f"✅ Subscribed to `{short_addr(addr)}`.\nYou'll be DM'd on every FOR reward.",
+            parse_mode="Markdown",
+            reply_markup=MAIN_KB,
+        )
+        return ConversationHandler.END
+
+    # Conversational path
+    await update.message.reply_text(
+        "Send me the wallet address you want to subscribe to "
+        "(paste it as `0x...`), or /cancel.",
+        parse_mode="Markdown",
+    )
+    return ASK_SUB_ADDR
+
+
+async def conv_subscribe_addr(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    addr = wstore.normalize_addr(text)
+    if not addr:
+        await update.message.reply_text(
+            "Not a valid address. Paste `0x` + 40 hex chars, or /cancel.",
             parse_mode="Markdown",
         )
-        return
-    try:
-        addr = wstore.subscribe(update.effective_chat.id, ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("Invalid address — must be `0x` + 40 hex chars.", parse_mode="Markdown")
-        return
+        return ASK_SUB_ADDR
+    wstore.subscribe(update.effective_chat.id, addr)
     await update.message.reply_text(
         f"✅ Subscribed to `{short_addr(addr)}`.\nYou'll be DM'd on every FOR reward.",
         parse_mode="Markdown",
+        reply_markup=MAIN_KB,
     )
+    return ConversationHandler.END
 
 
 async def cmd_unsubscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,15 +445,48 @@ async def lifespan(_app: FastAPI):
     log.info(f"Admin chat IDs configured: {sorted(ADMIN_CHAT_IDS) if ADMIN_CHAT_IDS else 'NONE — set ADMIN_CHAT_IDS env var to claim operator access'}")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Conversational handlers for Subscribe + Balance. Registered FIRST so they
+    # take precedence over the plain CommandHandlers.
+    subscribe_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("subscribe", conv_subscribe_entry),
+            MessageHandler(filters.Regex(f"^{BTN_SUBSCRIBE}$"), conv_subscribe_entry),
+        ],
+        states={
+            ASK_SUB_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_subscribe_addr)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        per_chat=True,
+        per_user=False,
+    )
+    balance_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("balance", conv_balance_entry),
+            MessageHandler(filters.Regex(f"^{BTN_BALANCE}$"), conv_balance_entry),
+        ],
+        states={
+            ASK_BAL_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_balance_addr)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        per_chat=True,
+        per_user=False,
+    )
+    application.add_handler(subscribe_conv)
+    application.add_handler(balance_conv)
+
+    # Button handlers (route to existing command logic)
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_MY_SUBS}$"), cmd_mywallets))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), cmd_help))
+
+    # Plain command handlers
+    application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("today", cmd_today))
-    application.add_handler(CommandHandler("balance", cmd_balance))
     application.add_handler(CommandHandler("recent", cmd_recent))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("uptime", cmd_uptime))
     application.add_handler(CommandHandler("version", cmd_version))
-    application.add_handler(CommandHandler("start", cmd_help))
-    application.add_handler(CommandHandler("subscribe", cmd_subscribe))
     application.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     application.add_handler(CommandHandler("mywallets", cmd_mywallets))
     application.add_handler(CommandHandler("wallet", cmd_wallet))
