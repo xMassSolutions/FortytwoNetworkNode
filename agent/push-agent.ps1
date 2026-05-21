@@ -181,32 +181,72 @@ if ($Once) {
     return
 }
 
-Write-Output "Fortytwo agent starting. Mode: event-driven (push on inference round completion). Bot URL: $BotUrl"
+Write-Output "Fortytwo agent starting. Mode: event-driven + 10-min heartbeat. Bot URL: $BotUrl"
 
-# One bootstrap push so the bot has fresh data immediately on agent start
+# Bootstrap push so the bot has fresh data immediately on agent start
+$lastPushTime = [DateTime]::MinValue
 try {
     Post-Snapshot (Get-NodeSnapshot)
+    $lastPushTime = Get-Date
 } catch {
     Write-Output ("[bootstrap] " + $_.Exception.Message)
 }
 
-# Tail extended_log.txt and push only when an inference round event lands
+# Initial file position: skip existing content, only push on NEW events
+$lastPos = if (Test-Path $ExtLog) { (Get-Item $ExtLog).Length } else { 0 }
+
+$HeartbeatMinutes    = 10
+$PollIntervalSeconds = 5
 $EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
+
 while ($true) {
+    Start-Sleep -Seconds $PollIntervalSeconds
+
+    # 10-min heartbeat (so bot snapshots survive its redeploys / silent periods)
+    if (((Get-Date) - $lastPushTime).TotalMinutes -ge $HeartbeatMinutes) {
+        $now = Get-Date -Format "HH:mm:ss"
+        Write-Output "[$now] heartbeat push"
+        try {
+            Post-Snapshot (Get-NodeSnapshot)
+            $lastPushTime = Get-Date
+        } catch {
+            Write-Output ("[heartbeat] " + $_.Exception.Message)
+        }
+    }
+
+    if (-not (Test-Path $ExtLog)) { continue }
+    $currentSize = (Get-Item $ExtLog).Length
+    if ($currentSize -lt $lastPos) { $lastPos = 0 }  # rotated / truncated
+    if ($currentSize -le $lastPos) { continue }
+
+    # Read new bytes from $lastPos to EOF
     try {
-        Get-Content -Path $ExtLog -Wait -Tail 0 -ErrorAction Stop | ForEach-Object {
-            if ($_ -match $EventPattern) {
-                $now = Get-Date -Format "HH:mm:ss"
-                Write-Output "[$now] inference event - pushing snapshot"
-                try {
-                    Post-Snapshot (Get-NodeSnapshot)
-                } catch {
-                    Write-Output ("[push] " + $_.Exception.Message)
-                }
+        $fs = [System.IO.File]::Open(
+            $ExtLog,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        $fs.Position = $lastPos
+        $sr = New-Object System.IO.StreamReader($fs)
+        $newContent = $sr.ReadToEnd()
+        $lastPos = $fs.Position
+        $sr.Close(); $fs.Close()
+    } catch {
+        Write-Output ("[read] " + $_.Exception.Message)
+        continue
+    }
+
+    foreach ($line in ($newContent -split "`n")) {
+        if ($line -match $EventPattern) {
+            $now = Get-Date -Format "HH:mm:ss"
+            Write-Output "[$now] inference event - pushing snapshot"
+            try {
+                Post-Snapshot (Get-NodeSnapshot)
+                $lastPushTime = Get-Date
+            } catch {
+                Write-Output ("[event push] " + $_.Exception.Message)
             }
         }
-    } catch {
-        Write-Output ("[tail] " + $_.Exception.Message + " - reopening in 5s")
-        Start-Sleep -Seconds 5
     }
 }

@@ -90,6 +90,7 @@ MAIN_KB = ReplyKeyboardMarkup(
 # Conversation states
 ASK_SUB_ADDR = 1
 ASK_BAL_ADDR = 2
+ASK_WALLET_ADDR = 3
 
 application: Application | None = None
 
@@ -131,26 +132,60 @@ def fmt_uptime(seconds: int | None) -> str:
 
 
 async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Comprehensive single-message view of the operator node."""
     if not is_admin(update):
-        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown")
+        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown", reply_markup=MAIN_KB)
         return
     s = store.latest
     if not s:
         await update.message.reply_text(
-            "No status received yet — the workstation agent hasn't pushed."
+            "No status received yet — the workstation agent hasn't pushed. "
+            "If the bot was just redeployed, expect data within ~10 min (next agent heartbeat) "
+            "or sooner on the next inference round.",
+            reply_markup=MAIN_KB,
         )
         return
-    alive = "✅ ALIVE" if s.capsule_alive and s.protocol_alive else "❌ DOWN"
-    model = s.model_short or "—"
-    msg = (
-        f"*Node:* {alive}\n"
-        f"*Model:* `{model}`\n"
-        f"*Max TPS:* {s.capsule_max_tps or '—'}\n"
-        f"*Capsule PID:* {s.capsule_pid or '—'}  "
-        f"*Protocol PID:* {s.protocol_pid or '—'}\n"
-        f"*Last seen:* {fmt_ago(s.received_at)}"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+
+    alive = "✅ ALIVE" if (s.capsule_alive and s.protocol_alive) else "❌ DOWN"
+
+    # Try to pull live FOR balance from chain
+    bal = None
+    try:
+        bal = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
+    except Exception:
+        pass
+
+    lines = [
+        f"*Node:* {alive}",
+        f"*Last push:* {fmt_ago(s.received_at)}",
+        "",
+        "*Model*",
+        f"`{s.model_short or '—'}`",
+        f"Max TPS: *{s.capsule_max_tps or '—'}*",
+        "",
+        "*Today (UTC)*",
+        f"Participated: *{s.rounds_participated_today}*",
+        f"Observed: {s.rounds_observed_today}",
+        f"Errors: {s.errors_today}",
+        f"First / last: {s.first_round_today_iso or '—'} / {s.last_round_today_iso or '—'}",
+    ]
+    if s.last_reward_amount is not None:
+        lines += [
+            "",
+            "*Last reward*",
+            f"+{fmt_for(s.last_reward_amount)} FOR at {s.last_reward_iso or '—'} UTC",
+        ]
+    lines += [
+        "",
+        "*Capsule*",
+        f"v`{s.capsule_version or '—'}`  PID {s.capsule_pid or '—'}  up {fmt_uptime(s.capsule_uptime_seconds)}",
+        "*Protocol*",
+        f"v`{s.protocol_version or '—'}`  PID {s.protocol_pid or '—'}",
+    ]
+    if bal is not None:
+        lines += ["", f"*FOR balance:* {fmt_for(bal)} (`{short_addr(WALLET)}`)"]
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=MAIN_KB)
 
 
 async def cmd_today(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -198,7 +233,12 @@ async def _do_balance(update: Update, target: str) -> None:
 
 
 async def conv_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for /balance [0x...] OR the 💰 Check balance button."""
+    """Entry point for /balance [0x...] OR the 💰 Check balance button.
+
+    With an address arg → process directly. Otherwise (command no-args OR
+    button tap) → enter conversation and ask for the address. Admin's quick
+    operator-wallet path is via /status now.
+    """
     if ctx.args:
         cand = wstore.normalize_addr(ctx.args[0])
         if not cand:
@@ -209,11 +249,6 @@ async def conv_balance_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             )
             return ConversationHandler.END
         await _do_balance(update, cand)
-        return ConversationHandler.END
-
-    # No args
-    if is_admin(update):
-        await _do_balance(update, WALLET)
         return ConversationHandler.END
 
     await update.message.reply_text(
@@ -415,26 +450,50 @@ async def cmd_mywallets(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
-async def cmd_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.message.reply_text("Usage: `/wallet 0x<address>`", parse_mode="Markdown")
-        return
-    addr = wstore.normalize_addr(ctx.args[0])
-    if not addr:
-        await update.message.reply_text("Invalid address.", parse_mode="Markdown")
-        return
+async def _do_wallet(update: Update, addr: str) -> None:
     try:
         for_bal = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, addr)
         mon_bal = await get_native_balance(MONAD_RPC_URL, addr)
     except Exception as e:
-        await update.message.reply_text(f"RPC error: {e}")
+        await update.message.reply_text(f"RPC error: {e}", reply_markup=MAIN_KB)
         return
     msg = (
-        f"*Wallet:* `{short_addr(addr)}`\n"
+        f"*Wallet:* `{short_addr(addr)}` (Monad Testnet)\n"
         f"*FOR balance:* {fmt_for(for_bal)}\n"
         f"*MONAD balance:* {mon_bal:.4f}"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KB)
+
+
+async def conv_wallet_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if ctx.args:
+        addr = wstore.normalize_addr(ctx.args[0])
+        if not addr:
+            await update.message.reply_text(
+                "Invalid address.", parse_mode="Markdown", reply_markup=MAIN_KB,
+            )
+            return ConversationHandler.END
+        await _do_wallet(update, addr)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Send me the wallet address (paste `0x...`), or /cancel.",
+        parse_mode="Markdown",
+    )
+    return ASK_WALLET_ADDR
+
+
+async def conv_wallet_addr(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    addr = wstore.normalize_addr(text)
+    if not addr:
+        await update.message.reply_text(
+            "Not a valid address. Paste `0x` + 40 hex chars, or /cancel.",
+            parse_mode="Markdown",
+        )
+        return ASK_WALLET_ADDR
+    await _do_wallet(update, addr)
+    return ConversationHandler.END
 
 
 @asynccontextmanager
@@ -472,8 +531,18 @@ async def lifespan(_app: FastAPI):
         per_chat=True,
         per_user=False,
     )
+    wallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("wallet", conv_wallet_entry)],
+        states={
+            ASK_WALLET_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_wallet_addr)],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+        per_chat=True,
+        per_user=False,
+    )
     application.add_handler(subscribe_conv)
     application.add_handler(balance_conv)
+    application.add_handler(wallet_conv)
 
     # Button handlers (route to existing command logic)
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_MY_SUBS}$"), cmd_mywallets))
@@ -489,7 +558,6 @@ async def lifespan(_app: FastAPI):
     application.add_handler(CommandHandler("version", cmd_version))
     application.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     application.add_handler(CommandHandler("mywallets", cmd_mywallets))
-    application.add_handler(CommandHandler("wallet", cmd_wallet))
     application.add_handler(CommandHandler("myid", cmd_myid))
     await application.initialize()
     await application.start()
