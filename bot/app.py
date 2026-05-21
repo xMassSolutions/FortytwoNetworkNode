@@ -32,6 +32,38 @@ MONAD_RPC_URL = os.environ.get("MONAD_RPC_URL", "https://testnet-rpc.monad.xyz/"
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 WEBHOOK_PATH = "/telegram/webhook"
 
+def _parse_admin_ids() -> set[int]:
+    raw = os.environ.get("ADMIN_CHAT_IDS", "").strip()
+    out: set[int] = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            out.add(int(x))
+        except ValueError:
+            log.warning(f"ADMIN_CHAT_IDS: ignoring non-int value {x!r}")
+    return out
+
+ADMIN_CHAT_IDS: set[int] = _parse_admin_ids()
+
+
+def is_admin(update: Update) -> bool:
+    if not ADMIN_CHAT_IDS:
+        return False
+    chat = update.effective_chat
+    return bool(chat and chat.id in ADMIN_CHAT_IDS)
+
+
+NON_ADMIN_REDIRECT = (
+    "This command shows the bot operator's node data. You can use:\n"
+    "/wallet `0x…` — any wallet's FOR + MONAD balance\n"
+    "/balance `0x…` — quick FOR balance for any wallet\n"
+    "/subscribe `0x…` — receive reward DMs for a wallet\n"
+    "/mywallets — list your subscriptions\n"
+    "/help — all commands"
+)
+
 application: Application | None = None
 
 
@@ -72,6 +104,9 @@ def fmt_uptime(seconds: int | None) -> str:
 
 
 async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown")
+        return
     s = store.latest
     if not s:
         await update.message.reply_text(
@@ -92,6 +127,9 @@ async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_today(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown")
+        return
     s = store.latest
     if not s:
         await update.message.reply_text("No status received yet.")
@@ -109,17 +147,25 @@ async def cmd_today(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    # Accept optional wallet argument, otherwise use the operator wallet
-    target = WALLET
+    # With argument: query any wallet (public). Without: operator wallet (admin only).
+    target = None
     if ctx.args:
         cand = wstore.normalize_addr(ctx.args[0])
         if not cand:
             await update.message.reply_text(
-                "Usage: `/balance` or `/balance 0x<address>`",
+                "Usage: `/balance 0x<address>`",
                 parse_mode="Markdown",
             )
             return
         target = cand
+    else:
+        if not is_admin(update):
+            await update.message.reply_text(
+                "Specify a wallet: `/balance 0x<address>`",
+                parse_mode="Markdown",
+            )
+            return
+        target = WALLET
     try:
         bal = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, target)
     except Exception as e:
@@ -144,6 +190,9 @@ async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_recent(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown")
+        return
     s = store.latest
     if not s or not s.recent_rounds:
         await update.message.reply_text("No round history received yet.")
@@ -158,25 +207,46 @@ async def cmd_recent(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = (
-        "*Available commands*\n"
-        "/status — operator node alive, model, max TPS\n"
-        "/today — rounds participated today (operator)\n"
-        "/balance `[wallet]` — FOR balance (operator if no arg, any wallet otherwise)\n"
-        "/recent — last 5 inference rounds (operator)\n"
-        "/uptime — Capsule process uptime (operator)\n"
-        "/version — Capsule + Protocol versions (operator)\n"
-        "\n*Multi-wallet*\n"
-        "/wallet `0x...` — query any wallet's FOR + MONAD balance\n"
-        "/subscribe `0x...` — receive DM notifications on every FOR reward\n"
-        "/unsubscribe `0x...` — stop notifications for a wallet\n"
-        "/mywallets — list your subscriptions\n"
-        f"\n*Dashboard:* {PUBLIC_URL}/dashboard"
+    public_block = (
+        "*Wallet commands (anyone)*\n"
+        "/wallet `0x…` — FOR + MONAD balance for any wallet\n"
+        "/balance `0x…` — quick FOR balance\n"
+        "/subscribe `0x…` — DM me on every FOR reward to a wallet\n"
+        "/unsubscribe `0x…` — stop notifications\n"
+        "/mywallets — your subscriptions\n"
+        "/myid — show your Telegram chat ID\n"
+        "/help — this message"
     )
+    admin_block = (
+        "\n\n*Operator commands (admin only)*\n"
+        "/status — node alive, model, max TPS\n"
+        "/today — rounds participated today\n"
+        "/balance — operator wallet (no arg)\n"
+        "/recent — last 5 inference rounds\n"
+        "/uptime — Capsule process uptime\n"
+        "/version — Capsule + Protocol versions"
+    )
+    msg = public_block + (admin_block if is_admin(update) else "")
+    if PUBLIC_URL:
+        msg += f"\n\n*Dashboard:* {PUBLIC_URL}/dashboard"
     await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 
+async def cmd_myid(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = (
+        f"*Your chat ID:* `{chat.id}`\n"
+        f"*Username:* {('@' + user.username) if user and user.username else '—'}\n\n"
+        f"_To gain operator access, add this ID to the bot's `ADMIN_CHAT_IDS` env var._"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 async def cmd_uptime(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown")
+        return
     s = store.latest
     if not s:
         await update.message.reply_text("No status received yet.")
@@ -189,6 +259,9 @@ async def cmd_uptime(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_version(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update):
+        await update.message.reply_text(NON_ADMIN_REDIRECT, parse_mode="Markdown")
+        return
     s = store.latest
     if not s:
         await update.message.reply_text("No status received yet.")
@@ -273,12 +346,7 @@ async def lifespan(_app: FastAPI):
     global application
     init_schema()
     log.info("SQLite schema initialised")
-
-    # Auto-watch the operator wallet so it shows up in the dashboard list
-    try:
-        wstore.add_watched(WALLET, label="Operator")
-    except Exception as e:
-        log.warning(f"could not seed operator wallet: {e}")
+    log.info(f"Admin chat IDs configured: {sorted(ADMIN_CHAT_IDS) if ADMIN_CHAT_IDS else 'NONE — set ADMIN_CHAT_IDS env var to claim operator access'}")
 
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("status", cmd_status))
@@ -293,9 +361,39 @@ async def lifespan(_app: FastAPI):
     application.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     application.add_handler(CommandHandler("mywallets", cmd_mywallets))
     application.add_handler(CommandHandler("wallet", cmd_wallet))
+    application.add_handler(CommandHandler("myid", cmd_myid))
     await application.initialize()
     await application.start()
     log.info("Telegram application started")
+
+    # Register command menus: default (public) for everyone, full menu in each admin's chat
+    try:
+        from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
+        public_menu = [
+            BotCommand("wallet", "Any wallet's FOR + MONAD balance"),
+            BotCommand("balance", "Quick FOR balance for a wallet"),
+            BotCommand("subscribe", "DM me on every FOR reward to a wallet"),
+            BotCommand("unsubscribe", "Stop notifications for a wallet"),
+            BotCommand("mywallets", "List my subscribed wallets"),
+            BotCommand("myid", "Show my Telegram chat ID"),
+            BotCommand("help", "Show all commands"),
+        ]
+        admin_menu = public_menu + [
+            BotCommand("status", "Operator node status"),
+            BotCommand("today", "Operator rounds today"),
+            BotCommand("recent", "Last 5 inference rounds"),
+            BotCommand("uptime", "Capsule process uptime"),
+            BotCommand("version", "Capsule + Protocol versions"),
+        ]
+        await application.bot.set_my_commands(public_menu, scope=BotCommandScopeDefault())
+        for chat_id in ADMIN_CHAT_IDS:
+            try:
+                await application.bot.set_my_commands(admin_menu, scope=BotCommandScopeChat(chat_id))
+            except Exception as e:
+                log.warning(f"setMyCommands failed for admin {chat_id}: {e}")
+        log.info(f"Bot menu registered: {len(public_menu)} public, {len(admin_menu)} admin")
+    except Exception as e:
+        log.exception(f"setMyCommands setup failed: {e}")
 
     poller_task = asyncio.create_task(
         poll_loop(application, MONAD_RPC_URL, FOR_CONTRACT, interval=60)
