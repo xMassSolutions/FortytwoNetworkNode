@@ -43,17 +43,21 @@ function Get-NodeSnapshot {
         }
     }
 
-    $recent = @()
-    foreach ($line in ($roundLines | Select-Object -Last 5)) {
-        if ($line -match "(\d{2}:\d{2}:\d{2}).*Inference round (\w+) completed.*Total time: (\d+)s") {
-            $recent += [ordered]@{
-                completed_iso = $matches[1]
-                hash          = $matches[2]
-                duration_s    = [int]$matches[3]
+    $allToday = @()
+    foreach ($line in $roundLines) {
+        if ($line -match "(\d{2}):(\d{2}):(\d{2}).*Inference round (\w+) completed.*Total time: (\d+)s") {
+            $allToday += [ordered]@{
+                completed_iso = ("{0}:{1}:{2}" -f $matches[1], $matches[2], $matches[3])
+                hour          = [int]$matches[1]
+                hash          = $matches[4]
+                duration_s    = [int]$matches[5]
             }
         }
     }
-    [array]::Reverse($recent)  # newest first
+    # newest-first list of last 5 for backward compat / /recent command
+    $recent = @()
+    foreach ($r in ($allToday | Select-Object -Last 5)) { $recent += $r }
+    [array]::Reverse($recent)
 
     $maxTps = $null
     if (Test-Path $ExtLog) {
@@ -100,6 +104,22 @@ function Get-NodeSnapshot {
     $proto = Get-Process FortytwoProtocol -ErrorAction SilentlyContinue
     $capPid   = if ($cap)   { $cap.Id }   else { $null }
     $protoPid = if ($proto) { $proto.Id } else { $null }
+    $capUptime = $null
+    if ($cap -and $cap.StartTime) {
+        $capUptime = [int]((Get-Date) - $cap.StartTime).TotalSeconds
+    }
+
+    # Capsule + Protocol versions from Capsule.log header lines
+    $capsuleVersion = $null; $protocolVersion = $null
+    if (Test-Path $CapsuleLog) {
+        $vLine = Select-String -Path $CapsuleLog -Pattern "Fortytwo Capsule current version: (\S+)" | Select-Object -Last 1
+        if ($vLine) { $capsuleVersion = $vLine.Matches[0].Groups[1].Value.Trim() }
+    }
+    # Protocol writes version banner at extended_log.txt startup; pattern observed in logs
+    if (Test-Path $ExtLog) {
+        $pvLine = Select-String -Path $ExtLog -Pattern "(?:Protocol version|protocol.+version)[:\s]+v?(\d+\.\d+\.\d+)" | Select-Object -Last 1
+        if ($pvLine) { $protocolVersion = $pvLine.Matches[0].Groups[1].Value }
+    }
 
     $capsuleAlive = $false
     try {
@@ -113,6 +133,9 @@ function Get-NodeSnapshot {
         model                       = $model
         model_short                 = $modelShort
         capsule_max_tps             = $maxTps
+        capsule_version             = $capsuleVersion
+        protocol_version            = $protocolVersion
+        capsule_uptime_seconds      = $capUptime
         rounds_participated_today   = $participations
         rounds_observed_today       = $observed
         errors_today                = $errors
@@ -126,6 +149,7 @@ function Get-NodeSnapshot {
         capsule_alive               = $capsuleAlive
         protocol_alive              = $protocolAlive
         recent_rounds               = $recent
+        all_rounds_today            = $allToday
     }
 }
 

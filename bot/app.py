@@ -5,11 +5,13 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from chain import get_for_balance
+from dashboard_html import DASHBOARD_HTML
 from store import Snapshot, store
 
 log = logging.getLogger("bot")
@@ -48,6 +50,21 @@ def fmt_ago(ts_epoch: float | None) -> str:
 
 def short_addr(addr: str) -> str:
     return f"{addr[:6]}…{addr[-4:]}"
+
+
+def fmt_uptime(seconds: int | None) -> str:
+    if not seconds:
+        return "—"
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 24:
+        d, h = divmod(h, 24)
+        return f"{d}d {h}h"
+    if h > 0:
+        return f"{h}h {m}m"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
 
 
 async def cmd_status(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -123,6 +140,47 @@ async def cmd_recent(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_help(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "*Available commands*\n"
+        "/status — node alive, model, max TPS, last seen\n"
+        "/today — rounds participated, errors, first/last round\n"
+        "/balance — FOR balance from Monad chain + last reward\n"
+        "/recent — last 5 inference rounds\n"
+        "/uptime — Capsule process uptime\n"
+        "/version — Capsule + Protocol versions\n"
+        "/help — this message\n"
+        f"\n*Dashboard:* {PUBLIC_URL}/dashboard"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def cmd_uptime(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = store.latest
+    if not s:
+        await update.message.reply_text("No status received yet.")
+        return
+    msg = (
+        f"*Capsule uptime:* {fmt_uptime(s.capsule_uptime_seconds)}\n"
+        f"_Reported {fmt_ago(s.received_at)}_"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cmd_version(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    s = store.latest
+    if not s:
+        await update.message.reply_text("No status received yet.")
+        return
+    cv = s.capsule_version or "—"
+    pv = s.protocol_version or "—"
+    msg = (
+        f"*Capsule:* `{cv}`\n"
+        f"*Protocol:* `{pv}`"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global application
@@ -131,6 +189,10 @@ async def lifespan(_app: FastAPI):
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("balance", cmd_balance))
     application.add_handler(CommandHandler("recent", cmd_recent))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("uptime", cmd_uptime))
+    application.add_handler(CommandHandler("version", cmd_version))
+    application.add_handler(CommandHandler("start", cmd_help))
     await application.initialize()
     await application.start()
     log.info("Telegram application started")
@@ -149,6 +211,9 @@ class StatusPayload(BaseModel):
     model: str | None = None
     model_short: str | None = None
     capsule_max_tps: int | None = None
+    capsule_version: str | None = None
+    protocol_version: str | None = None
+    capsule_uptime_seconds: int | None = None
     rounds_participated_today: int = 0
     rounds_observed_today: int = 0
     errors_today: int = 0
@@ -162,6 +227,7 @@ class StatusPayload(BaseModel):
     capsule_alive: bool = False
     protocol_alive: bool = False
     recent_rounds: list[dict] = Field(default_factory=list)
+    all_rounds_today: list[dict] = Field(default_factory=list)
 
 
 def _require_agent_token(authorization: str | None) -> None:
@@ -190,6 +256,60 @@ async def telegram_webhook(request: Request):
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/dashboard")
+
+
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+
+@app.get("/v1/dashboard-data")
+async def dashboard_data():
+    s = store.latest
+    balance = None
+    balance_error = None
+    try:
+        balance = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
+    except Exception as e:
+        balance_error = str(e)
+
+    snapshot_dict = None
+    if s:
+        snapshot_dict = {
+            "received_at": s.received_at,
+            "ts": s.ts,
+            "model_short": s.model_short,
+            "capsule_max_tps": s.capsule_max_tps,
+            "capsule_version": s.capsule_version,
+            "protocol_version": s.protocol_version,
+            "capsule_uptime_seconds": s.capsule_uptime_seconds,
+            "rounds_participated_today": s.rounds_participated_today,
+            "rounds_observed_today": s.rounds_observed_today,
+            "errors_today": s.errors_today,
+            "first_round_today_iso": s.first_round_today_iso,
+            "last_round_today_iso": s.last_round_today_iso,
+            "last_round_duration_s": s.last_round_duration_s,
+            "last_reward_amount": s.last_reward_amount,
+            "last_reward_iso": s.last_reward_iso,
+            "capsule_pid": s.capsule_pid,
+            "protocol_pid": s.protocol_pid,
+            "capsule_alive": s.capsule_alive,
+            "protocol_alive": s.protocol_alive,
+            "recent_rounds": s.recent_rounds,
+            "all_rounds_today": s.all_rounds_today,
+        }
+    return JSONResponse({
+        "snapshot": snapshot_dict,
+        "balance": balance,
+        "balance_error": balance_error,
+        "wallet": WALLET,
+        "wallet_short": f"{WALLET[:6]}…{WALLET[-4:]}",
+    })
 
 
 @app.post("/admin/register-webhook")

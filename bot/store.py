@@ -9,6 +9,9 @@ class Snapshot:
     model: str | None = None
     model_short: str | None = None
     capsule_max_tps: int | None = None
+    capsule_version: str | None = None
+    protocol_version: str | None = None
+    capsule_uptime_seconds: int | None = None
     rounds_participated_today: int = 0
     rounds_observed_today: int = 0
     errors_today: int = 0
@@ -22,6 +25,7 @@ class Snapshot:
     capsule_alive: bool = False
     protocol_alive: bool = False
     recent_rounds: list[dict[str, Any]] = field(default_factory=list)
+    all_rounds_today: list[dict[str, Any]] = field(default_factory=list)
 
 
 class Store:
