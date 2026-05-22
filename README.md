@@ -1,137 +1,234 @@
-# FortytwoBot
+# FortytwoBot — FortyTwo Network node monitor
 
-Telegram bot for monitoring a FortyTwo Network inference node. Two pieces:
-
-- **`bot/`** — deploys to Render (free tier), always-on. Reads FOR balance from Monad Testnet. Receives node-status pushes from the workstation. Responds to Telegram commands.
-- **`agent/`** — runs on the Windows workstation that runs the node. Parses node logs every 30 seconds and pushes a snapshot to the bot.
-
-If the workstation goes offline, the bot stays up and `/balance` still works (chain-only). Other commands show "last seen N min ago".
-
-## Commands
-
-| Command | What it shows |
-|---|---|
-| `/status` | Capsule + Protocol alive, current model, advertised max TPS, last-seen time |
-| `/today` | Rounds participated today, rounds observed, errors, first/last round time |
-| `/balance` | FOR balance read live from Monad Testnet, plus last reward delta from logs |
-| `/recent` | Last 5 inference rounds (completion time, duration, hash) |
-
-## Setup
-
-### 1. Create the Telegram bot
-
-In Telegram, message [@BotFather](https://t.me/BotFather):
+A self-hostable dashboard + workstation agent for monitoring a [FortyTwo Network](https://fortytwo.network/) inference node. Tracks rounds, wins/losses, FOR rewards on Monad Testnet, TPS, and node health — all in a single web dashboard you reach from any browser.
 
 ```
-/newbot
-<pick a display name, e.g. "Fortytwo Network: Node Analysis">
-<pick a username ending in _bot, e.g. yourbot_bot>
+   ┌──────────────────┐         ┌────────────────────┐
+   │ FortyTwo node    │ logs    │ Workstation agent  │ HTTPS push
+   │ (Windows / Mac)  │────────▶│ (PowerShell / Py)  │──────────────┐
+   └──────────────────┘         └────────────────────┘              │
+                                                                    ▼
+                                              ┌────────────────────────────┐
+                                              │ Bot + dashboard (Render)   │
+                                              │ FastAPI + Chart.js         │
+                                              │ /dashboard accessible from │
+                                              │ any device with the URL    │
+                                              └────────────────────────────┘
 ```
 
-Save the token it gives you (looks like `1234567890:AAA-BBB-ccc...`).
+## What you get
 
-### 2. Push the code to GitHub
+- **Live balance card** — FOR balance read from Monad Testnet RPC every 3 min, plus today's earned and wins count.
+- **Node card** — process status, capsule/protocol versions, uptime, plus a **Max / Actual** toggle for TPS and symbols-per-second.
+- **Today card (UTC)** — rounds participated, observed, errors, W/L counts and win rate.
+- **Rounds chart** — toggleable 24-hour, 7-day, or 4-week view of participation.
+- **Recent rounds, last 3 errors, last 100 log lines** — each in its own card.
+- **Multi-wallet watch** — track FOR + MONAD balances on any address.
+- **Telegram bot** (optional) — same data via `/status`, `/today`, `/balance`, `/recent` commands.
 
-Already done if you cloned this repo. Otherwise, from the project root:
+The dashboard URL works on phones, tablets, and desktops (responsive layout, Add-to-Home-Screen for app-like access).
+
+---
+
+## Quick install (AI agent)
+
+If you have a coding agent with tool use (Claude, ChatGPT-with-tools, etc.), paste this prompt and it should handle the whole install:
+
+> Install the FortyTwo Network node monitoring stack from
+> `https://github.com/<your-fork>/FortytwoBot` for me.
+>
+> Steps:
+> 1. Fork the repo to my GitHub account if I haven't already.
+> 2. Deploy the `bot/` service to my Render account using the blueprint at
+>    `render.yaml`. Prompt me for `WALLET` (my Monad Testnet operator wallet)
+>    and generate a random 40-char `AGENT_TOKEN`. Set `PUBLIC_URL` after the
+>    first deploy completes and trigger a manual redeploy.
+> 3. Detect my OS and install the workstation agent:
+>    - Windows: run `agent/install-as-task.ps1 -BotUrl <URL> -AgentToken <TOKEN> -ScriptsRoot <PATH>` where `<PATH>` points at my `fortytwo-p2p-inference-scripts-main` folder.
+>    - macOS: run `agent/install-mac.sh <URL> <TOKEN> <SCRIPTS_ROOT>`.
+> 4. Open `<URL>/dashboard` and confirm the node stats are populating.
+> 5. Tell me the dashboard URL when done.
+>
+> Tools required: GitHub access (to fork), terminal access (to install the agent),
+> and a Render account (browser or API). Wallet address must come from me — don't
+> guess or auto-generate.
+
+The block is informational — copy it into another LLM session if you want the install done for you. The manual steps below cover the same ground.
+
+---
+
+## Manual install
+
+### 1. Deploy the bot to Render
+
+1. Fork this repo to your GitHub account.
+2. Sign up at <https://render.com> (free tier, no card required).
+3. In Render, click **New +** → **Blueprint** → connect your forked repo. Render auto-detects `render.yaml`.
+4. Render will prompt you for these env vars (all marked `sync: false` so you set them per deploy):
+
+   | Var | Required | What to put |
+   |---|---|---|
+   | `WALLET` | yes | Your Monad Testnet operator wallet (`0x…`) |
+   | `AGENT_TOKEN` | yes | Random 32+ char shared secret — generate one |
+   | `PUBLIC_URL` | yes (after first deploy) | The service URL Render gives you (`https://<service>.onrender.com`) |
+   | `TELEGRAM_TOKEN` | optional | Only if you want the Telegram bot half; from [@BotFather](https://t.me/BotFather) |
+   | `ADMIN_CHAT_IDS` | optional | Comma-separated Telegram chat IDs for `/status`-style admin commands |
+
+   Generate an `AGENT_TOKEN`:
+
+   ```bash
+   # macOS / Linux
+   openssl rand -hex 20
+
+   # Windows (PowerShell)
+   -join ((48..57)+(97..122) | Get-Random -Count 40 | ForEach-Object {[char]$_})
+   ```
+
+5. **Apply**. First build is 3–5 min (Docker image build).
+6. Once the service is live, copy its URL from the Render dashboard, set `PUBLIC_URL` in **Environment** to that URL, and trigger a **Manual Deploy**.
+7. Verify: open `https://<service>.onrender.com/healthz` — should return `{"ok":true}`.
+8. (Optional) **Custom domain**: in Render → service → **Settings** → **Custom Domains**, add your domain. Render gives you the DNS records to configure with your registrar.
+
+### 2. Install the workstation agent
+
+#### Windows
+
+In PowerShell on the machine running your FortyTwo node:
 
 ```powershell
-git init
-git branch -m main
-git add .
-git commit -m "initial commit"
-gh repo create FortytwoBot --private --source=. --push
-```
-
-### 3. Deploy the bot to Render
-
-1. Sign up at <https://render.com> (free tier, no credit card required).
-2. **New +** → **Blueprint** → connect the GitHub repo you just pushed. Render will auto-detect `render.yaml`.
-3. Render will prompt for the three secret env vars (the ones with `sync: false` in `render.yaml`):
-   - `TELEGRAM_TOKEN` — paste the @BotFather token
-   - `AGENT_TOKEN` — generate a random 32+ char string and paste (see snippet below)
-   - `PUBLIC_URL` — leave blank for now; we'll set it after deploy when we know the URL
-4. Click **Apply** / **Create New Resources**. First build takes ~3-5 minutes (Docker image build).
-
-Generate a random AGENT_TOKEN locally:
-
-```powershell
--join ((48..57)+(97..122) | Get-Random -Count 40 | ForEach-Object {[char]$_})
-```
-
-After the first deploy, the service URL appears at the top of the Render service page — typically `https://fortytwo-network-node-analysis.onrender.com`. Go to **Environment** in the Render dashboard, set `PUBLIC_URL` to that URL, and trigger a **Manual Deploy**.
-
-Register the Telegram webhook (one-time, after `PUBLIC_URL` is set):
-
-```powershell
-$AppUrl = "https://fortytwo-network-node-analysis.onrender.com"
-$AgentToken = "<the-agent-token-you-pasted-into-render>"
-Invoke-WebRequest -Uri "$AppUrl/admin/register-webhook" `
-    -Method POST -Headers @{Authorization="Bearer $AgentToken"} -UseBasicParsing | Select-Object -ExpandProperty Content
-```
-
-You should see `{"ok":true,"result":true,"description":"Webhook was set"}`. Open your bot in Telegram and send `/balance` — should return your FOR balance from chain even before the agent is installed.
-
-> **Note on Render free tier sleep:** Free Web Services sleep after 15 minutes of inactivity. The workstation agent pushes every 30 s, which keeps it awake. If the workstation goes offline for >15 min, the bot will sleep and the first request from Telegram will have a ~30 s cold start. To prevent sleep entirely, add a free [UptimeRobot](https://uptimerobot.com) HTTP monitor hitting `https://<app>.onrender.com/healthz` every 5 minutes.
-
-### 4. Install the workstation agent
-
-In a regular PowerShell on the same machine running your FortyTwo node:
-
-```powershell
-cd C:\Users\youruser\FortytwoBot\agent
-.\install-as-task.ps1 -BotUrl "https://fortytwo-network-node-analysis.onrender.com" -AgentToken "$AgentToken"
+cd $env:USERPROFILE
+git clone https://github.com/<your-fork>/FortytwoBot
+cd FortytwoBot\agent
+.\install-as-task.ps1 `
+    -BotUrl "https://<service>.onrender.com" `
+    -AgentToken "<your-agent-token>" `
+    -ScriptsRoot "C:\path\to\fortytwo-p2p-inference-scripts-main"
 ```
 
 This creates a Windows Scheduled Task that:
 - runs at logon
 - restarts on failure (3 retries, 1 min apart)
-- runs forever (no time limit)
+- runs indefinitely (no time limit)
 - writes a rolling log to `agent\agent.log`
 
 Verify pushes:
 
 ```powershell
-Get-Content C:\Users\youruser\FortytwoBot\agent\agent.log -Tail 5 -Wait
+Get-Content $env:USERPROFILE\FortytwoBot\agent\agent.log -Tail 10 -Wait
 ```
 
-You should see one `push ok:` line every 30 seconds. In Telegram, `/status` should now return your live node info.
+Expect a `push ok:` line every ~30 seconds (or every 10 minutes when idle).
 
-## Configuration reference
+#### macOS
 
-### Bot env vars (set in Render dashboard → Environment)
+In Terminal on the machine running your FortyTwo node:
+
+```bash
+cd ~
+git clone https://github.com/<your-fork>/FortytwoBot
+cd FortytwoBot/agent
+./install-mac.sh \
+    "https://<service>.onrender.com" \
+    "<your-agent-token>" \
+    "$HOME/path/to/fortytwo-p2p-inference-scripts-main"
+```
+
+This writes a launchd plist to `~/Library/LaunchAgents/com.fortytwo.agent.plist`, loads it, and starts pushing. The agent restarts at login and survives crashes (`KeepAlive`).
+
+Verify pushes:
+
+```bash
+tail -f ~/Library/Logs/fortytwo-agent.log
+```
+
+Uninstall:
+
+```bash
+./uninstall-mac.sh
+```
+
+### 3. Open the dashboard
+
+`https://<service>.onrender.com/dashboard` — works on any browser. Bookmark or Add to Home Screen on your phone for an app-like icon.
+
+---
+
+## Configuration
+
+### Bot env vars (set in Render → Environment)
 
 | Var | Required | Default | Notes |
 |---|---|---|---|
-| `TELEGRAM_TOKEN` | yes | — | From @BotFather |
+| `WALLET` | yes | — | Your operator wallet. App fails to start without it. |
 | `AGENT_TOKEN` | yes | — | Shared secret between bot and agent |
 | `PUBLIC_URL` | yes | — | `https://<service>.onrender.com` (no trailing slash) |
-| `WALLET` | no | `0xYourMonadTestnetWallet` | Operator wallet to query |
-| `FOR_CONTRACT` | no | `0xf6B888f442277F01294F94D555608A2E8Bc86430` | FOR token on Monad Testnet |
+| `TELEGRAM_TOKEN` | no | — | If set, enables the Telegram bot commands |
+| `ADMIN_CHAT_IDS` | no | — | Comma-separated chat IDs for admin-only commands |
+| `FOR_CONTRACT` | no | `0xf6B888…6430` | FOR token on Monad Testnet — leave default |
 | `MONAD_RPC_URL` | no | `https://testnet-rpc.monad.xyz/` | Override if rate-limited |
 
 ### Agent params
 
-`install-as-task.ps1 -BotUrl <url> -AgentToken <token> [-TaskName ...] [-ScriptsRoot ...]`
+`install-as-task.ps1 -BotUrl <url> -AgentToken <token> -ScriptsRoot <path> [-TaskName ...]`
 
-`-ScriptsRoot` defaults to your CLI install at `C:\Users\youruser\FortytwoCLI\fortytwo-p2p-inference-scripts-main` — change if your node lives elsewhere.
+`install-mac.sh <bot-url> <agent-token> <scripts-root>`
+
+`-ScriptsRoot` / third arg is the path to your local `fortytwo-p2p-inference-scripts-main` directory (it's where `extended_log.txt` and `FortytwoNode/debug/FortytwoCapsule.log` live).
+
+---
 
 ## Troubleshooting
 
-**Bot doesn't respond in Telegram.** Open the Render dashboard → service → **Logs** and look for errors. Verify the webhook is registered: `curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo`.
+**Dashboard shows "No data" after a Render redeploy.** The bot's snapshot store is in-memory and resets on redeploy. Wait up to 10 min for the next heartbeat from the agent, or restart the agent:
 
-**`/balance` works but `/status`, `/today`, `/recent` say "no status received".** Agent isn't pushing. Check `agent\agent.log`. If empty, the Scheduled Task didn't start — `Get-ScheduledTask FortytwoBotAgent | Get-ScheduledTaskInfo`.
+```powershell
+# Windows
+Restart-ScheduledTask -TaskName FortytwoBotAgent
+```
 
-**Agent pushes failing with 401.** Token mismatch. Compare the `AGENT_TOKEN` env var in the Render dashboard against the value in `agent\_agent-wrapper.ps1`.
+```bash
+# macOS
+launchctl kickstart -k gui/$(id -u)/com.fortytwo.agent
+```
 
-**`/balance` errors with `RPC error`.** Monad public RPC may be rate-limited. Switch to another endpoint: set `MONAD_RPC_URL` to another RPC in Render's **Environment** tab.
+**`/balance` errors with `RPC error`.** The default `MONAD_RPC_URL` may be rate-limited. Set it to an alternate RPC endpoint in the Render dashboard.
 
-**Workstation reboots.** Bot keeps serving `/balance`. `/status` shows "last seen N min ago" until the workstation comes back and the agent resumes pushing at logon.
+**Agent pushes failing with HTTP 401.** Token mismatch. Compare `AGENT_TOKEN` in Render → Environment against the value the agent install scripts used. Re-run the installer with the matching value.
+
+**Bot deploy fails with `KeyError: 'WALLET'`.** You haven't set the `WALLET` env var in Render. Add it under Environment and trigger a Manual Deploy.
+
+**Workstation reboots.** Bot keeps serving `/balance` from chain. Dashboard shows "last seen N min ago" until the workstation comes back and the agent resumes at logon (Win) or login (Mac).
+
+**Render free-tier sleep.** Free Web Services sleep after 15 min of inactivity. The 10-min heartbeat from the agent keeps it awake. If the workstation goes offline for > 15 min the bot will sleep and the first request from a phone/browser will have a ~30s cold start. Optional: free [UptimeRobot](https://uptimerobot.com) HTTP monitor on `/healthz` every 5 min to keep it hot.
+
+---
+
+## Architecture
+
+- **Bot** (`bot/`) — Python FastAPI service on Render. Receives agent pushes at `POST /v1/status`, serves the dashboard at `GET /dashboard`, reads on-chain balance from Monad Testnet for the balance card. State is in-memory (`bot/store.py`); the only persistent storage is a tiny SQLite for wallet watches + Telegram subscriptions.
+
+- **Agent** (`agent/`) — workstation-resident script. Polls `extended_log.txt` for new inference events (5s tick), pushes a snapshot to the bot via HTTPS on each event, plus a 10-minute heartbeat. Maintains a rolling 30-day hourly-rounds buffer in `rounds-history.json` next to the script (survives bot redeploys; lost only on workstation reformat).
+
+- **Dashboard** (`bot/dashboard_html.py`) — single-file HTML+JS. Fetches `/v1/dashboard-data` every 3 min. Chart.js bar chart with 24h/7d/4w toggle. No build step.
+
+---
 
 ## Stop / remove
 
 ```powershell
-# Stop the agent on your workstation
+# Windows
 .\agent\uninstall-task.ps1
 ```
 
+```bash
+# macOS
+./agent/uninstall-mac.sh
+```
+
 To remove the bot service: Render dashboard → service → **Settings** → **Delete Service**.
+
+---
+
+## License
+
+TBD.
