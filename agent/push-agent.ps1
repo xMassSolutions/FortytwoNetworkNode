@@ -12,9 +12,74 @@ if (-not $DryRun) {
     if (-not $AgentToken) { throw "FORTYTWO_AGENT_TOKEN env not set (or pass -AgentToken, or use -DryRun)" }
 }
 
-$ExtLog     = Join-Path $ScriptsRoot "extended_log.txt"
-$CapsuleLog = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.log"
-$ReadyUrl   = "http://localhost:42442/ready"
+$ExtLog          = Join-Path $ScriptsRoot "extended_log.txt"
+$CapsuleLog      = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.log"
+$ReadyUrl        = "http://localhost:42442/ready"
+$RoundsHistoryFile = Join-Path $PSScriptRoot "rounds-history.json"
+
+function Read-RoundsHistory($path) {
+    if (-not (Test-Path $path)) { return @{} }
+    try {
+        $raw = Get-Content -Path $path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+        $h = @{}
+        foreach ($p in $obj.PSObject.Properties) { $h[$p.Name] = [int]$p.Value }
+        return $h
+    } catch {
+        return @{}
+    }
+}
+
+function Write-RoundsHistory($history, $path) {
+    try {
+        $tmp = "$path.tmp"
+        ($history | ConvertTo-Json -Compress) | Set-Content -Path $tmp -Encoding utf8 -NoNewline
+        Move-Item -Path $tmp -Destination $path -Force
+    } catch { }
+}
+
+function Update-RoundsHistory($allToday, $todayUtcDate, $path) {
+    $history = Read-RoundsHistory $path
+
+    # Idempotency: zero today's keys before recounting (heartbeats can fire multiple times per hour)
+    $todayPrefix = "${todayUtcDate}T"
+    foreach ($key in @($history.Keys)) {
+        if ($key.StartsWith($todayPrefix)) { $history.Remove($key) }
+    }
+
+    foreach ($r in $allToday) {
+        if ($null -ne $r.hour) {
+            $key = "$todayUtcDate" + "T" + ("{0:D2}" -f [int]$r.hour)
+            if ($history.ContainsKey($key)) { $history[$key] = [int]$history[$key] + 1 }
+            else { $history[$key] = 1 }
+        }
+    }
+
+    $cutoffDate = (Get-Date).ToUniversalTime().AddDays(-30).ToString("yyyy-MM-dd")
+    foreach ($key in @($history.Keys)) {
+        if ($key.Length -ge 10 -and $key.Substring(0, 10) -lt $cutoffDate) {
+            $history.Remove($key)
+        }
+    }
+
+    Write-RoundsHistory $history $path
+    return $history
+}
+
+function Get-LogTail($path, $n = 100) {
+    if (-not (Test-Path $path)) { return ,@() }
+    $result = New-Object System.Collections.ArrayList
+    try {
+        $lines = @(Get-Content -Path $path -Tail $n -ErrorAction Stop)
+        foreach ($line in $lines) {
+            $clean = $line -replace "`e\[[0-9;]*m", ""
+            if ($clean.Length -gt 500) { $clean = $clean.Substring(0, 500) }
+            [void]$result.Add($clean)
+        }
+    } catch { }
+    return ,$result.ToArray()
+}
 
 function Get-NodeSnapshot {
     $todayUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
@@ -28,11 +93,12 @@ function Get-NodeSnapshot {
     $roundLines     = @($todayLines | Where-Object { $_ -match "Inference round.*Total time" })
     $observed       = $roundLines.Count
     # Exclude transport-layer noise (Kademlia bootstrap timeouts, peer Identify timeouts) — counts only inference-relevant errors
-    $errors = @($todayLines | Where-Object {
+    $errorLines = @($todayLines | Where-Object {
         $_ -match " ERROR " -and
         $_ -notmatch "Kademlia bootstrap is timeout" -and
         $_ -notmatch "Identify: error with peer"
-    }).Count
+    })
+    $errors = $errorLines.Count
 
     $firstRound = $null; $lastRound = $null; $lastDuration = $null
     if ($roundLines.Count -gt 0) {
@@ -59,6 +125,18 @@ function Get-NodeSnapshot {
     foreach ($r in ($allToday | Select-Object -Last 5)) { $recent += $r }
     [array]::Reverse($recent)
 
+    # Last 5 errors, newest-first, with timestamp + message
+    $recentErrors = @()
+    foreach ($line in ($errorLines | Select-Object -Last 5)) {
+        $iso = $null
+        if ($line -match "(\d{2}:\d{2}:\d{2})") { $iso = $matches[1] }
+        $msg = $line -replace "^UTC \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*", ""
+        $msg = $msg -replace "`e\[[0-9;]*m", ""
+        if ($msg.Length -gt 500) { $msg = $msg.Substring(0, 500) }
+        $recentErrors += [ordered]@{ iso = $iso; message = $msg }
+    }
+    if ($recentErrors.Count -gt 1) { [array]::Reverse($recentErrors) }
+
     $maxTps = $null
     if (Test-Path $ExtLog) {
         $tpsLine = Select-String -Path $ExtLog -Pattern "has max tokens per second: (\d+)" | Select-Object -Last 1
@@ -83,6 +161,23 @@ function Get-NodeSnapshot {
                 }
             }
         }
+    }
+
+    # Sum of all positive reward deltas in today's log
+    $rewardsTodayTotal = $null
+    $todayBalanceLines = @($todayLines | Where-Object { $_ -match "FOR balance (before|after) reward" })
+    if ($todayBalanceLines.Count -ge 2) {
+        $totalSum = 0.0
+        for ($i = 1; $i -lt $todayBalanceLines.Count; $i++) {
+            $before = $todayBalanceLines[$i-1]
+            $after  = $todayBalanceLines[$i]
+            if ($before -match "balance before reward: (\d+\.?\d*)" -and $after -match "balance after reward: (\d+\.?\d*)") {
+                $beforeVal = [double]([regex]::Match($before, "balance before reward: (\d+\.?\d*)").Groups[1].Value)
+                $afterVal  = [double]([regex]::Match($after,  "balance after reward: (\d+\.?\d*)").Groups[1].Value)
+                if ($afterVal -gt $beforeVal) { $totalSum += ($afterVal - $beforeVal) }
+            }
+        }
+        if ($totalSum -gt 0) { $rewardsTodayTotal = [math]::Round($totalSum, 6) }
     }
 
     $model = $null; $modelShort = $null
@@ -128,6 +223,13 @@ function Get-NodeSnapshot {
     } catch { $capsuleAlive = $false }
     $protocolAlive = [bool]$proto
 
+    # Rolling 30-day rounds history (persisted to rounds-history.json next to this script)
+    $roundsHistory = Update-RoundsHistory $allToday $todayUtc $RoundsHistoryFile
+
+    # Tail last 100 lines of each log
+    $logExtended = Get-LogTail $ExtLog 100
+    $logCapsule  = Get-LogTail $CapsuleLog 100
+
     return [ordered]@{
         ts                          = (Get-Date).ToUniversalTime().ToString("o")
         model                       = $model
@@ -144,17 +246,22 @@ function Get-NodeSnapshot {
         last_round_duration_s       = $lastDuration
         last_reward_amount          = $lastReward
         last_reward_iso             = $lastRewardTime
+        rewards_today_total         = $rewardsTodayTotal
         capsule_pid                 = $capPid
         protocol_pid                = $protoPid
         capsule_alive               = $capsuleAlive
         protocol_alive              = $protocolAlive
         recent_rounds               = $recent
         all_rounds_today            = $allToday
+        rounds_history              = $roundsHistory
+        recent_errors               = $recentErrors
+        log_extended                = @($logExtended)
+        log_capsule                 = @($logCapsule)
     }
 }
 
 function Post-Snapshot($snap) {
-    $body = $snap | ConvertTo-Json -Depth 5 -Compress
+    $body = $snap | ConvertTo-Json -Depth 6 -Compress
     $headers = @{
         Authorization  = "Bearer $AgentToken"
         "Content-Type" = "application/json"
@@ -172,7 +279,7 @@ function Post-Snapshot($snap) {
 
 if ($DryRun) {
     $snap = Get-NodeSnapshot
-    $snap | ConvertTo-Json -Depth 5
+    $snap | ConvertTo-Json -Depth 6
     return
 }
 
