@@ -55,8 +55,8 @@ a { color: var(--blue); text-decoration: none; }
       <div class="section-header" style="margin-bottom:12px">
         <h2 style="margin-bottom:0">Node</h2>
         <span class="toggle-group">
-          <button class="toggle-btn active" data-tps="max">Max</button>
-          <button class="toggle-btn" data-tps="actual">Actual</button>
+          <button class="toggle-btn active" data-tps="actual">Actual</button>
+          <button class="toggle-btn" data-tps="max">Max</button>
         </span>
       </div>
       <div id="node-content">…</div>
@@ -128,7 +128,7 @@ a { color: var(--blue); text-decoration: none; }
 let chart;
 let chartMode = 'hourly';
 let logMode = 'extended';
-let tpsMode = 'max';
+let tpsMode = 'actual';
 let lastSnapshot = null;
 
 function pad(n){ return String(n).padStart(2,'0'); }

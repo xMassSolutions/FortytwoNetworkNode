@@ -159,18 +159,14 @@ BALANCE_LINE_RE = re.compile(r"FOR balance (before|after) reward")
 BAL_BEFORE_RE = re.compile(r"balance before reward: (\d+\.?\d*)")
 BAL_AFTER_RE = re.compile(r"balance after reward: (\d+\.?\d*)")
 
-MAX_TPS_RE = re.compile(r"has max tokens per second: (\d+)")
+CAPABILITY_LINE_RE = re.compile(
+    r"has max tokens per second:\s*(\d+),?\s*max symbols per second:\s*(\d+)"
+)
 MODEL_LOCAL_RE = re.compile(r"Using local LLM model: (.+)$")
 MODEL_HF_RE = re.compile(r"--llm-hf-model-name\s+(\S+)")
 CAPSULE_VERSION_RE = re.compile(r"Fortytwo Capsule current version: (\S+)")
 PROTOCOL_VERSION_RE = re.compile(
     r"(?:Protocol version|protocol.+version)[:\s]+v?(\d+\.\d+\.\d+)"
-)
-
-# Combined TPS/symbols line (commit-3 onwards)
-TPS_LINE_RE = re.compile(
-    r"TPS:\s*(\d+\.?\d*)\s+symbols per second:\s*(\d+\.?\d*).*?"
-    r"Max TPS:\s*(\d+\.?\d*)[,\s]+max symbols per second:\s*(\d+\.?\d*)"
 )
 
 EVENT_PATTERN_RE = re.compile(
@@ -292,10 +288,25 @@ def get_node_snapshot(scripts_root: Path, history_file: Path) -> dict[str, Any]:
         recent_errors.append({"iso": iso, "message": msg})
     recent_errors.reverse()
 
-    # max_tps: scan whole file (covers all-time), then potentially overwritten by TPS line below
+    # Capability lines emitted throughout the day:
+    #   ... has max tokens per second: N, max symbols per second: N, max tokens size: N, max symbols size: N
+    # LATEST line = current capability. HIGHEST value across all lines = all-time max.
     max_tps: int | None = None
-    for m in MAX_TPS_RE.finditer(ext_content):
-        max_tps = int(m.group(1))
+    max_symbols: float | None = None
+    tps_current: float | None = None
+    symbols_current: float | None = None
+    cap_matches = list(CAPABILITY_LINE_RE.finditer(ext_content))
+    for m in cap_matches:
+        tps = int(m.group(1))
+        sym = int(m.group(2))
+        if max_tps is None or tps > max_tps:
+            max_tps = tps
+        if max_symbols is None or sym > max_symbols:
+            max_symbols = float(sym)
+    if cap_matches:
+        last = cap_matches[-1]
+        tps_current = float(last.group(1))
+        symbols_current = float(last.group(2))
 
     # Most recent positive reward (whole-file scan, last 200 balance lines)
     last_reward: float | None = None
@@ -336,18 +347,6 @@ def get_node_snapshot(scripts_root: Path, history_file: Path) -> dict[str, Any]:
                     wins_today += 1
         if total_sum > 0:
             rewards_today_total = round(total_sum, 6)
-
-    # Combined TPS/symbols line — last match wins, also harvests max
-    tps_current: float | None = None
-    symbols_current: float | None = None
-    max_symbols: float | None = None
-    for ln in today_lines:
-        m = TPS_LINE_RE.search(ln)
-        if m:
-            tps_current = float(m.group(1))
-            symbols_current = float(m.group(2))
-            max_tps = int(round(float(m.group(3))))
-            max_symbols = float(m.group(4))
 
     # Model
     model: str | None = None

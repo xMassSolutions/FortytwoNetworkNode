@@ -138,10 +138,24 @@ function Get-NodeSnapshot {
     }
     if ($recentErrors.Count -gt 1) { [array]::Reverse($recentErrors) }
 
-    $maxTps = $null
+    # TPS/symbols capability lines emitted by the Capsule throughout the day:
+    #   ... has max tokens per second: N, max symbols per second: N, max tokens size: N, max symbols size: N
+    # The LATEST line = current capability. The HIGHEST seen across the log = all-time max.
+    $maxTps = $null; $maxSymbols = $null
+    $tpsCurrent = $null; $symbolsCurrent = $null
     if (Test-Path $ExtLog) {
-        $tpsLine = Select-String -Path $ExtLog -Pattern "has max tokens per second: (\d+)" | Select-Object -Last 1
-        if ($tpsLine) { $maxTps = [int]$tpsLine.Matches[0].Groups[1].Value }
+        $capLines = Select-String -Path $ExtLog -Pattern "has max tokens per second:\s*(\d+),?\s*max symbols per second:\s*(\d+)"
+        foreach ($m in $capLines) {
+            $tps = [int]$m.Matches[0].Groups[1].Value
+            $sym = [int]$m.Matches[0].Groups[2].Value
+            if ($null -eq $maxTps -or $tps -gt $maxTps) { $maxTps = $tps }
+            if ($null -eq $maxSymbols -or $sym -gt $maxSymbols) { $maxSymbols = [double]$sym }
+        }
+        if ($capLines.Count -gt 0) {
+            $last = $capLines[-1]
+            $tpsCurrent     = [double]$last.Matches[0].Groups[1].Value
+            $symbolsCurrent = [double]$last.Matches[0].Groups[2].Value
+        }
     }
 
     # Find the most recent POSITIVE reward (Protocol logs balance pairs even when delta is 0)
@@ -183,20 +197,6 @@ function Get-NodeSnapshot {
             }
         }
         if ($totalSum -gt 0) { $rewardsTodayTotal = [math]::Round($totalSum, 6) }
-    }
-
-    # Parse the combined TPS/symbols line; emits TPS:N symbols per second:N Max TPS:N max symbols per second:N
-    # Last match wins (= most recent round's numbers); also harvests max fields from the same line.
-    $tpsCurrent = $null; $symbolsCurrent = $null; $maxSymbols = $null
-    $tpsLineRegex = "TPS:\s*(\d+\.?\d*)\s+symbols per second:\s*(\d+\.?\d*).*?Max TPS:\s*(\d+\.?\d*)[,\s]+max symbols per second:\s*(\d+\.?\d*)"
-    foreach ($line in $todayLines) {
-        if ($line -match $tpsLineRegex) {
-            $tpsCurrent     = [double]$matches[1]
-            $symbolsCurrent = [double]$matches[2]
-            # Prefer the log's reported max (covers all-time history, not just today)
-            $maxTps     = [int][math]::Round([double]$matches[3])
-            $maxSymbols = [double]$matches[4]
-        }
     }
 
     $model = $null; $modelShort = $null
