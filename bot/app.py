@@ -627,12 +627,17 @@ class StatusPayload(BaseModel):
     last_round_duration_s: int | None = None
     last_reward_amount: float | None = None
     last_reward_iso: str | None = None
+    rewards_today_total: float | None = None
     capsule_pid: int | None = None
     protocol_pid: int | None = None
     capsule_alive: bool = False
     protocol_alive: bool = False
     recent_rounds: list[dict] = Field(default_factory=list)
     all_rounds_today: list[dict] = Field(default_factory=list)
+    rounds_history: dict[str, int] = Field(default_factory=dict)
+    recent_errors: list[dict] = Field(default_factory=list)
+    log_extended: list[str] = Field(default_factory=list)
+    log_capsule: list[str] = Field(default_factory=list)
 
 
 def _require_agent_token(authorization: str | None) -> None:
@@ -742,12 +747,17 @@ async def dashboard_data():
             "last_round_duration_s": s.last_round_duration_s,
             "last_reward_amount": s.last_reward_amount,
             "last_reward_iso": s.last_reward_iso,
+            "rewards_today_total": s.rewards_today_total,
             "capsule_pid": s.capsule_pid,
             "protocol_pid": s.protocol_pid,
             "capsule_alive": s.capsule_alive,
             "protocol_alive": s.protocol_alive,
             "recent_rounds": s.recent_rounds,
             "all_rounds_today": s.all_rounds_today,
+            "rounds_history": s.rounds_history,
+            "recent_errors": s.recent_errors,
+            "log_extended": s.log_extended,
+            "log_capsule": s.log_capsule,
         }
     return JSONResponse({
         "snapshot": snapshot_dict,
