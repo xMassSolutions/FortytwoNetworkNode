@@ -2,7 +2,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>FortyTwo Node Status</title>
+<title>FortyTwo Network: Node Analysis</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 :root { --bg:#0a0a0a; --card:#141414; --text:#e8e8e8; --muted:#888; --green:#4ade80; --red:#f87171; --blue:#60a5fa; --border:#2a2a2a; }
@@ -46,12 +46,21 @@ a { color: var(--blue); text-decoration: none; }
 <body>
 <div class="container">
   <header>
-    <h1>FortyTwo Node Status</h1>
+    <h1>FortyTwo Network: Node Analysis</h1>
     <div class="meta" id="meta">Loading…</div>
   </header>
   <div class="grid">
     <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
-    <div class="card"><h2>Node</h2><div id="node-content">…</div></div>
+    <div class="card">
+      <div class="section-header" style="margin-bottom:12px">
+        <h2 style="margin-bottom:0">Node</h2>
+        <span class="toggle-group">
+          <button class="toggle-btn active" data-tps="max">Max</button>
+          <button class="toggle-btn" data-tps="actual">Actual</button>
+        </span>
+      </div>
+      <div id="node-content">…</div>
+    </div>
     <div class="card"><h2>Today (UTC)</h2><div id="today-content">…</div></div>
   </div>
   <div class="chart-wrap">
@@ -119,6 +128,7 @@ a { color: var(--blue); text-decoration: none; }
 let chart;
 let chartMode = 'hourly';
 let logMode = 'extended';
+let tpsMode = 'max';
 let lastSnapshot = null;
 
 function pad(n){ return String(n).padStart(2,'0'); }
@@ -215,6 +225,28 @@ function updateErrors(s){
     : '<tr><td colspan="2" style="color:var(--muted);text-align:center">No errors today</td></tr>';
 }
 
+function renderTpsRows(s){
+  if (tpsMode === 'max') {
+    return row('Max TPS', fmt(s.capsule_max_tps))
+      + row('Max symbols/sec', s.max_symbols != null ? fmtNum(s.max_symbols) : '—');
+  }
+  return row('TPS', s.tps_current != null ? fmtNum(s.tps_current) : '—')
+    + row('Symbols/sec', s.symbols_current != null ? fmtNum(s.symbols_current) : '—');
+}
+
+function renderNodeCard(s){
+  const el = document.getElementById('node-content');
+  if (!s) { el.innerHTML = row('Status', '<span class="badge down">No data</span>'); return; }
+  const alive = (s.capsule_alive && s.protocol_alive) ? '<span class="badge ok">ALIVE</span>' : '<span class="badge down">DOWN</span>';
+  el.innerHTML =
+      row('Status', alive)
+    + row('Model', `<span style="font-size:11px">${s.model_short||'—'}</span>`)
+    + renderTpsRows(s)
+    + row('Capsule', `${s.capsule_version||'—'} <span style="color:var(--muted)">PID ${s.capsule_pid||'—'}</span>`)
+    + row('Protocol', `${s.protocol_version||'—'} <span style="color:var(--muted)">PID ${s.protocol_pid||'—'}</span>`)
+    + row('Uptime', fmtUp(s.capsule_uptime_seconds));
+}
+
 async function refresh(){
   let data;
   try { const r = await fetch('/v1/dashboard-data',{cache:'no-store'}); data = await r.json(); }
@@ -233,14 +265,7 @@ async function refresh(){
     document.getElementById('today-content').innerHTML = row('Status','—');
     document.getElementById('rounds-body').innerHTML = '<tr><td colspan="3" style="color:var(--muted);text-align:center">No data</td></tr>';
   } else {
-    const alive = (s.capsule_alive && s.protocol_alive) ? '<span class="badge ok">ALIVE</span>' : '<span class="badge down">DOWN</span>';
-    document.getElementById('node-content').innerHTML =
-        row('Status', alive)
-      + row('Model', `<span style="font-size:11px">${s.model_short||'—'}</span>`)
-      + row('Max TPS', fmt(s.capsule_max_tps))
-      + row('Capsule', `${s.capsule_version||'—'} <span style="color:var(--muted)">PID ${s.capsule_pid||'—'}</span>`)
-      + row('Protocol', `${s.protocol_version||'—'} <span style="color:var(--muted)">PID ${s.protocol_pid||'—'}</span>`)
-      + row('Uptime', fmtUp(s.capsule_uptime_seconds));
+    renderNodeCard(s);
 
     const participated = s.rounds_participated_today || 0;
     const wins = s.wins_today || 0;
@@ -347,6 +372,14 @@ document.querySelectorAll('.toggle-btn[data-log]').forEach(btn => {
     logMode = btn.dataset.log;
     document.querySelectorAll('.toggle-btn[data-log]').forEach(b => b.classList.toggle('active', b.dataset.log === logMode));
     updateLog(lastSnapshot);
+  });
+});
+
+document.querySelectorAll('.toggle-btn[data-tps]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    tpsMode = btn.dataset.tps;
+    document.querySelectorAll('.toggle-btn[data-tps]').forEach(b => b.classList.toggle('active', b.dataset.tps === tpsMode));
+    if (lastSnapshot) renderNodeCard(lastSnapshot);
   });
 });
 

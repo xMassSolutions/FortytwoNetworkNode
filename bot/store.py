@@ -22,6 +22,9 @@ class Snapshot:
     last_reward_iso: str | None = None
     rewards_today_total: float | None = None
     wins_today: int = 0
+    tps_current: float | None = None
+    symbols_current: float | None = None
+    max_symbols: float | None = None
     capsule_pid: int | None = None
     protocol_pid: int | None = None
     capsule_alive: bool = False

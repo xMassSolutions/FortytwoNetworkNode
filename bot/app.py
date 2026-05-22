@@ -629,6 +629,9 @@ class StatusPayload(BaseModel):
     last_reward_iso: str | None = None
     rewards_today_total: float | None = None
     wins_today: int = 0
+    tps_current: float | None = None
+    symbols_current: float | None = None
+    max_symbols: float | None = None
     capsule_pid: int | None = None
     protocol_pid: int | None = None
     capsule_alive: bool = False
@@ -750,6 +753,9 @@ async def dashboard_data():
             "last_reward_iso": s.last_reward_iso,
             "rewards_today_total": s.rewards_today_total,
             "wins_today": s.wins_today,
+            "tps_current": s.tps_current,
+            "symbols_current": s.symbols_current,
+            "max_symbols": s.max_symbols,
             "capsule_pid": s.capsule_pid,
             "protocol_pid": s.protocol_pid,
             "capsule_alive": s.capsule_alive,
