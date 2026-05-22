@@ -1,8 +1,8 @@
 param(
     [Parameter(Mandatory)] [string]$BotUrl,
     [Parameter(Mandatory)] [string]$AgentToken,
-    [string]$TaskName = "FortytwoBotAgent",
-    [string]$ScriptsRoot = "C:\Users\youruser\FortytwoCLI\fortytwo-p2p-inference-scripts-main"
+    [Parameter(Mandatory)] [string]$ScriptsRoot,
+    [string]$TaskName = "FortytwoBotAgent"
 )
 
 $here   = Split-Path -Parent $MyInvocation.MyCommand.Path

@@ -2,7 +2,8 @@ param(
     [string]$BotUrl = $env:FORTYTWO_BOT_URL,
     [string]$AgentToken = $env:FORTYTWO_AGENT_TOKEN,
     [int]$IntervalSeconds = 30,
-    [string]$ScriptsRoot = "C:\Users\youruser\FortytwoCLI\fortytwo-p2p-inference-scripts-main",
+    [Parameter(Mandatory=$true)]
+    [string]$ScriptsRoot,
     [switch]$Once,
     [switch]$DryRun
 )
@@ -125,9 +126,9 @@ function Get-NodeSnapshot {
     foreach ($r in ($allToday | Select-Object -Last 5)) { $recent += $r }
     [array]::Reverse($recent)
 
-    # Last 5 errors, newest-first, with timestamp + message
+    # Last 3 errors, newest-first, with timestamp + message
     $recentErrors = @()
-    foreach ($line in ($errorLines | Select-Object -Last 5)) {
+    foreach ($line in ($errorLines | Select-Object -Last 3)) {
         $iso = $null
         if ($line -match "(\d{2}:\d{2}:\d{2})") { $iso = $matches[1] }
         $msg = $line -replace "^UTC \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*", ""
@@ -163,8 +164,9 @@ function Get-NodeSnapshot {
         }
     }
 
-    # Sum of all positive reward deltas in today's log
+    # Sum + count of positive reward deltas in today's log
     $rewardsTodayTotal = $null
+    $winsToday = 0
     $todayBalanceLines = @($todayLines | Where-Object { $_ -match "FOR balance (before|after) reward" })
     if ($todayBalanceLines.Count -ge 2) {
         $totalSum = 0.0
@@ -174,10 +176,27 @@ function Get-NodeSnapshot {
             if ($before -match "balance before reward: (\d+\.?\d*)" -and $after -match "balance after reward: (\d+\.?\d*)") {
                 $beforeVal = [double]([regex]::Match($before, "balance before reward: (\d+\.?\d*)").Groups[1].Value)
                 $afterVal  = [double]([regex]::Match($after,  "balance after reward: (\d+\.?\d*)").Groups[1].Value)
-                if ($afterVal -gt $beforeVal) { $totalSum += ($afterVal - $beforeVal) }
+                if ($afterVal -gt $beforeVal) {
+                    $totalSum += ($afterVal - $beforeVal)
+                    $winsToday += 1
+                }
             }
         }
         if ($totalSum -gt 0) { $rewardsTodayTotal = [math]::Round($totalSum, 6) }
+    }
+
+    # Parse the combined TPS/symbols line; emits TPS:N symbols per second:N Max TPS:N max symbols per second:N
+    # Last match wins (= most recent round's numbers); also harvests max fields from the same line.
+    $tpsCurrent = $null; $symbolsCurrent = $null; $maxSymbols = $null
+    $tpsLineRegex = "TPS:\s*(\d+\.?\d*)\s+symbols per second:\s*(\d+\.?\d*).*?Max TPS:\s*(\d+\.?\d*)[,\s]+max symbols per second:\s*(\d+\.?\d*)"
+    foreach ($line in $todayLines) {
+        if ($line -match $tpsLineRegex) {
+            $tpsCurrent     = [double]$matches[1]
+            $symbolsCurrent = [double]$matches[2]
+            # Prefer the log's reported max (covers all-time history, not just today)
+            $maxTps     = [int][math]::Round([double]$matches[3])
+            $maxSymbols = [double]$matches[4]
+        }
     }
 
     $model = $null; $modelShort = $null
@@ -247,6 +266,10 @@ function Get-NodeSnapshot {
         last_reward_amount          = $lastReward
         last_reward_iso             = $lastRewardTime
         rewards_today_total         = $rewardsTodayTotal
+        wins_today                  = $winsToday
+        tps_current                 = $tpsCurrent
+        symbols_current             = $symbolsCurrent
+        max_symbols                 = $maxSymbols
         capsule_pid                 = $capPid
         protocol_pid                = $protoPid
         capsule_alive               = $capsuleAlive
