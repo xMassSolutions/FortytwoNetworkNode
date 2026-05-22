@@ -33,6 +33,14 @@ tr:last-child td { border-bottom: none; }
 footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; padding-bottom: 16px; }
 a { color: var(--blue); text-decoration: none; }
 .section-title { font-size: 11px; text-transform: uppercase; color: var(--muted); margin-bottom: 12px; letter-spacing: 0.5px; font-weight: 600; }
+.section-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.section-header .section-title { margin-bottom: 0; }
+.toggle-group { display: inline-flex; gap: 4px; }
+.toggle-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: inherit; text-transform: uppercase; letter-spacing: 0.5px; }
+.toggle-btn:hover { color: var(--text); }
+.toggle-btn.active { background: var(--blue); color: #000; border-color: var(--blue); }
+.log-view { white-space: pre-wrap; max-height: 400px; overflow-y: auto; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--muted); background: var(--bg); padding: 12px; border-radius: 6px; margin: 0; word-break: break-all; }
+.err-msg { color: var(--red); word-break: break-word; white-space: pre-wrap; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -42,12 +50,19 @@ a { color: var(--blue); text-decoration: none; }
     <div class="meta" id="meta">Loading…</div>
   </header>
   <div class="grid">
+    <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
     <div class="card"><h2>Node</h2><div id="node-content">…</div></div>
     <div class="card"><h2>Today (UTC)</h2><div id="today-content">…</div></div>
-    <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
   </div>
   <div class="chart-wrap">
-    <div class="section-title">Rounds per hour (today UTC)</div>
+    <div class="section-header">
+      <span class="section-title">Rounds participated</span>
+      <span class="toggle-group">
+        <button class="toggle-btn active" data-mode="hourly">24h</button>
+        <button class="toggle-btn" data-mode="daily">7d</button>
+        <button class="toggle-btn" data-mode="weekly">4w</button>
+      </span>
+    </div>
     <canvas id="hourChart"></canvas>
   </div>
   <div class="rounds-list">
@@ -55,6 +70,14 @@ a { color: var(--blue); text-decoration: none; }
     <table>
       <thead><tr><th>Time UTC</th><th>Duration</th><th>Request hash</th></tr></thead>
       <tbody id="rounds-body"></tbody>
+    </table>
+  </div>
+
+  <div class="rounds-list" style="margin-top: 16px;">
+    <div class="section-title">Last 5 errors</div>
+    <table>
+      <thead><tr><th>Time UTC</th><th>Message</th></tr></thead>
+      <tbody id="errors-body"><tr><td colspan="2" style="color:var(--muted);text-align:center">Loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -77,17 +100,120 @@ a { color: var(--blue); text-decoration: none; }
     </table>
   </div>
 
+  <div class="rounds-list" style="margin-top: 16px;">
+    <div class="section-header">
+      <span class="section-title">Node log (last 100 lines)</span>
+      <span class="toggle-group">
+        <button class="toggle-btn active" data-log="extended">extended</button>
+        <button class="toggle-btn" data-log="capsule">capsule</button>
+      </span>
+    </div>
+    <pre id="log-view" class="log-view"></pre>
+  </div>
+
   <footer>Auto-refresh every 30s · <span id="updated"></span></footer>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
 let chart;
+let chartMode = 'hourly';
+let logMode = 'extended';
+let lastSnapshot = null;
+
+function pad(n){ return String(n).padStart(2,'0'); }
 function fmt(v){return v==null?'—':v;}
 function fmtNum(n){return n==null?'—':Number(n).toLocaleString(undefined,{maximumFractionDigits:2});}
 function fmtAgo(epoch){if(!epoch)return'never';const d=Date.now()/1000-epoch;if(d<60)return`${Math.round(d)}s ago`;if(d<3600)return`${Math.round(d/60)}m ago`;if(d<86400)return`${Math.round(d/3600)}h ago`;return`${Math.round(d/86400)}d ago`;}
 function fmtUp(s){if(!s)return'—';const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);if(d>0)return`${d}d ${h}h`;if(h>0)return`${h}h ${m}m`;return`${m}m`;}
 function row(l,v){return`<div class="row"><span class="label">${l}</span><span class="value">${v}</span></div>`;}
+function escapeHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function hourKeyFromDate(d){return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}`;}
+
+function bucket(history, mode){
+  history = history || {};
+  const now = new Date();
+  if (mode === 'hourly'){
+    const anchorMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours());
+    const labels=[], data=[];
+    for (let i=23; i>=0; i--){
+      const t = new Date(anchorMs - i*3600e3);
+      labels.push(pad(t.getUTCHours()));
+      data.push(history[hourKeyFromDate(t)] || 0);
+    }
+    return {labels, data};
+  }
+  if (mode === 'daily'){
+    const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    const labels=[], data=[];
+    for (let i=6; i>=0; i--){
+      const d = new Date(todayMs - i*86400e3);
+      const datePrefix = `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
+      let sum = 0;
+      for (let h=0; h<24; h++){ sum += history[`${datePrefix}T${pad(h)}`] || 0; }
+      labels.push(`${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`);
+      data.push(sum);
+    }
+    return {labels, data};
+  }
+  if (mode === 'weekly'){
+    const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    const dow = (new Date(todayMs).getUTCDay() + 6) % 7;
+    const weekStartMs = todayMs - dow*86400e3;
+    const labels=[], data=[];
+    for (let w=3; w>=0; w--){
+      const startMs = weekStartMs - w*7*86400e3;
+      let sum = 0;
+      for (let day=0; day<7; day++){
+        const d = new Date(startMs + day*86400e3);
+        const datePrefix = `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
+        for (let h=0; h<24; h++){ sum += history[`${datePrefix}T${pad(h)}`] || 0; }
+      }
+      const startD = new Date(startMs);
+      labels.push(`wk ${pad(startD.getUTCMonth()+1)}-${pad(startD.getUTCDate())}`);
+      data.push(sum);
+    }
+    return {labels, data};
+  }
+  return {labels:[], data:[]};
+}
+
+function updateChart(history){
+  const { labels, data } = bucket(history || {}, chartMode);
+  if (!chart){
+    const ctx = document.getElementById('hourChart').getContext('2d');
+    chart = new Chart(ctx, {
+      type: 'bar',
+      data: { labels, datasets: [{ data, backgroundColor: '#60a5fa', borderColor: '#3b82f6', borderWidth: 1, borderRadius: 3 }] },
+      options: { responsive: true, maintainAspectRatio: true, aspectRatio: 4,
+        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `${c.parsed.y} round(s)` } } },
+        scales: {
+          x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', font: { size: 10 } } },
+          y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', precision: 0 } }
+        }
+      }
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update('none');
+  }
+}
+
+function updateLog(s){
+  const pre = document.getElementById('log-view');
+  if (!s) { pre.textContent = '(no data)'; return; }
+  const lines = (logMode === 'extended' ? s.log_extended : s.log_capsule) || [];
+  pre.textContent = lines.length ? lines.join('\n') : '(no log lines received)';
+}
+
+function updateErrors(s){
+  const errs = (s && s.recent_errors) || [];
+  const body = document.getElementById('errors-body');
+  body.innerHTML = errs.length
+    ? errs.map(e => `<tr><td style="white-space:nowrap">${escapeHtml(e.iso||'—')}</td><td class="err-msg">${escapeHtml(e.message||'')}</td></tr>`).join('')
+    : '<tr><td colspan="2" style="color:var(--muted);text-align:center">No errors today</td></tr>';
+}
 
 async function refresh(){
   let data;
@@ -95,6 +221,7 @@ async function refresh(){
   catch(e){ document.getElementById('meta').textContent='fetch error: '+e.message; return; }
 
   const s = data.snapshot;
+  lastSnapshot = s;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
 
   document.getElementById('meta').innerHTML = s
@@ -131,31 +258,15 @@ async function refresh(){
   if(data.balance!=null){
     document.getElementById('balance-content').innerHTML =
       `<div class="balance-big">${fmtNum(data.balance)} <span style="color:var(--muted);font-size:14px;font-weight:400">FOR</span></div>`
-      + (s && s.last_reward_amount ? `<div class="balance-reward">+${fmtNum(s.last_reward_amount)} FOR at ${s.last_reward_iso} UTC</div>` : '');
+      + (s && s.rewards_today_total ? `<div class="balance-reward">+${fmtNum(s.rewards_today_total)} FOR earned today</div>` : '')
+      + (s && s.last_reward_amount ? `<div class="balance-reward" style="color:var(--muted)">last +${fmtNum(s.last_reward_amount)} FOR at ${s.last_reward_iso||'—'} UTC</div>` : '');
   } else {
     document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${data.balance_error||'unknown'}</div>`;
   }
 
-  const hourly = new Array(24).fill(0);
-  ((s && s.all_rounds_today) || []).forEach(r => { if(typeof r.hour === 'number') hourly[r.hour]++; });
-  const labels = Array.from({length:24}, (_,i)=>String(i).padStart(2,'0'));
-  if(!chart){
-    const ctx = document.getElementById('hourChart').getContext('2d');
-    chart = new Chart(ctx, {
-      type: 'bar',
-      data: { labels, datasets: [{ data: hourly, backgroundColor: '#60a5fa', borderColor: '#3b82f6', borderWidth: 1, borderRadius: 3 }] },
-      options: { responsive: true, maintainAspectRatio: true, aspectRatio: 4,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `${c.parsed.y} round(s)` } } },
-        scales: {
-          x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', font: { size: 10 } } },
-          y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', precision: 0 } }
-        }
-      }
-    });
-  } else {
-    chart.data.datasets[0].data = hourly;
-    chart.update('none');
-  }
+  updateChart(s ? s.rounds_history : {});
+  updateErrors(s);
+  updateLog(s);
 }
 async function refreshWallets(){
   try {
@@ -211,6 +322,22 @@ document.getElementById('add-form').addEventListener('submit', async (e) => {
     msg.textContent = 'Error: ' + err.message;
     msg.style.color = 'var(--red)';
   }
+});
+
+document.querySelectorAll('.toggle-btn[data-mode]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    chartMode = btn.dataset.mode;
+    document.querySelectorAll('.toggle-btn[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === chartMode));
+    updateChart(lastSnapshot ? lastSnapshot.rounds_history : {});
+  });
+});
+
+document.querySelectorAll('.toggle-btn[data-log]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    logMode = btn.dataset.log;
+    document.querySelectorAll('.toggle-btn[data-log]').forEach(b => b.classList.toggle('active', b.dataset.log === logMode));
+    updateLog(lastSnapshot);
+  });
 });
 
 refresh();
