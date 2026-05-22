@@ -29,16 +29,5 @@ def init_schema() -> None:
             label      TEXT,
             added_at   INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            chat_id    INTEGER NOT NULL,
-            wallet     TEXT    NOT NULL,
-            created_at INTEGER NOT NULL,
-            PRIMARY KEY (chat_id, wallet)
-        );
-        CREATE TABLE IF NOT EXISTS poller_state (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        );
-        CREATE INDEX IF NOT EXISTS subs_by_wallet ON subscriptions(wallet);
         """)
         conn.commit()

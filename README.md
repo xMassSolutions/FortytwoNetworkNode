@@ -24,7 +24,6 @@ A self-hostable dashboard + workstation agent for monitoring a [FortyTwo Network
 - **Rounds chart** — toggleable 24-hour, 7-day, or 4-week view of participation.
 - **Recent rounds, last 3 errors, last 100 log lines** — each in its own card.
 - **Multi-wallet watch** — track FOR + MONAD balances on any address.
-- **Telegram bot** (optional) — same data via `/status`, `/today`, `/balance`, `/recent` commands.
 
 The dashboard URL works on phones, tablets, and desktops (responsive layout, Add-to-Home-Screen for app-like access).
 
@@ -41,8 +40,7 @@ If you have a coding agent with tool use (Claude, ChatGPT-with-tools, etc.), pas
 > 1. Fork the repo to my GitHub account if I haven't already.
 > 2. Deploy the `bot/` service to my Render account using the blueprint at
 >    `render.yaml`. Prompt me for `WALLET` (my Monad Testnet operator wallet)
->    and generate a random 40-char `AGENT_TOKEN`. Set `PUBLIC_URL` after the
->    first deploy completes and trigger a manual redeploy.
+>    and generate a random 40-char `AGENT_TOKEN`.
 > 3. Detect my OS and install the workstation agent:
 >    - Windows: run `agent/install-as-task.ps1 -BotUrl <URL> -AgentToken <TOKEN> -ScriptsRoot <PATH>` where `<PATH>` points at my `fortytwo-p2p-inference-scripts-main` folder.
 >    - macOS: run `agent/install-mac.sh <URL> <TOKEN> <SCRIPTS_ROOT>`.
@@ -70,9 +68,6 @@ The block is informational — copy it into another LLM session if you want the 
    |---|---|---|
    | `WALLET` | yes | Your Monad Testnet operator wallet (`0x…`) |
    | `AGENT_TOKEN` | yes | Random 32+ char shared secret — generate one |
-   | `PUBLIC_URL` | yes (after first deploy) | The service URL Render gives you (`https://<service>.onrender.com`) |
-   | `TELEGRAM_TOKEN` | optional | Only if you want the Telegram bot half; from [@BotFather](https://t.me/BotFather) |
-   | `ADMIN_CHAT_IDS` | optional | Comma-separated Telegram chat IDs for `/status`-style admin commands |
 
    Generate an `AGENT_TOKEN`:
 
@@ -85,9 +80,8 @@ The block is informational — copy it into another LLM session if you want the 
    ```
 
 5. **Apply**. First build is 3–5 min (Docker image build).
-6. Once the service is live, copy its URL from the Render dashboard, set `PUBLIC_URL` in **Environment** to that URL, and trigger a **Manual Deploy**.
-7. Verify: open `https://<service>.onrender.com/healthz` — should return `{"ok":true}`.
-8. (Optional) **Custom domain**: in Render → service → **Settings** → **Custom Domains**, add your domain. Render gives you the DNS records to configure with your registrar.
+6. Verify: open `https://<service>.onrender.com/healthz` — should return `{"ok":true}`.
+7. (Optional) **Custom domain**: in Render → service → **Settings** → **Custom Domains**, add your domain. Render gives you the DNS records to configure with your registrar.
 
 ### 2. Install the workstation agent
 
@@ -161,9 +155,6 @@ Uninstall:
 |---|---|---|---|
 | `WALLET` | yes | — | Your operator wallet. App fails to start without it. |
 | `AGENT_TOKEN` | yes | — | Shared secret between bot and agent |
-| `PUBLIC_URL` | yes | — | `https://<service>.onrender.com` (no trailing slash) |
-| `TELEGRAM_TOKEN` | no | — | If set, enables the Telegram bot commands |
-| `ADMIN_CHAT_IDS` | no | — | Comma-separated chat IDs for admin-only commands |
 | `FOR_CONTRACT` | no | `0xf6B888…6430` | FOR token on Monad Testnet — leave default |
 | `MONAD_RPC_URL` | no | `https://testnet-rpc.monad.xyz/` | Override if rate-limited |
 
@@ -191,13 +182,13 @@ Restart-ScheduledTask -TaskName FortytwoBotAgent
 launchctl kickstart -k gui/$(id -u)/com.fortytwo.agent
 ```
 
-**`/balance` errors with `RPC error`.** The default `MONAD_RPC_URL` may be rate-limited. Set it to an alternate RPC endpoint in the Render dashboard.
+**Balance card shows `RPC error`.** The default `MONAD_RPC_URL` may be rate-limited. Set it to an alternate RPC endpoint in the Render dashboard.
 
 **Agent pushes failing with HTTP 401.** Token mismatch. Compare `AGENT_TOKEN` in Render → Environment against the value the agent install scripts used. Re-run the installer with the matching value.
 
 **Bot deploy fails with `KeyError: 'WALLET'`.** You haven't set the `WALLET` env var in Render. Add it under Environment and trigger a Manual Deploy.
 
-**Workstation reboots.** Bot keeps serving `/balance` from chain. Dashboard shows "last seen N min ago" until the workstation comes back and the agent resumes at logon (Win) or login (Mac).
+**Workstation reboots.** Bot keeps serving the live FOR balance from chain. Dashboard shows "last seen N min ago" until the workstation comes back and the agent resumes at logon (Win) or login (Mac).
 
 **Render free-tier sleep.** Free Web Services sleep after 15 min of inactivity. The 10-min heartbeat from the agent keeps it awake. If the workstation goes offline for > 15 min the bot will sleep and the first request from a phone/browser will have a ~30s cold start. Optional: free [UptimeRobot](https://uptimerobot.com) HTTP monitor on `/healthz` every 5 min to keep it hot.
 
@@ -205,7 +196,7 @@ launchctl kickstart -k gui/$(id -u)/com.fortytwo.agent
 
 ## Architecture
 
-- **Bot** (`bot/`) — Python FastAPI service on Render. Receives agent pushes at `POST /v1/status`, serves the dashboard at `GET /dashboard`, reads on-chain balance from Monad Testnet for the balance card. State is in-memory (`bot/store.py`); the only persistent storage is a tiny SQLite for wallet watches + Telegram subscriptions.
+- **Bot** (`bot/`) — Python FastAPI service on Render. Receives agent pushes at `POST /v1/status`, serves the dashboard at `GET /dashboard`, reads on-chain balance from Monad Testnet for the balance card. State is in-memory (`bot/store.py`); the only persistent storage is a tiny SQLite for the dashboard's multi-wallet watch list.
 
 - **Agent** (`agent/`) — workstation-resident script. Polls `extended_log.txt` for new inference events (5s tick), pushes a snapshot to the bot via HTTPS on each event, plus a 10-minute heartbeat. Maintains a rolling 30-day hourly-rounds buffer in `rounds-history.json` next to the script (survives bot redeploys; lost only on workstation reformat).
 
