@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -32,37 +33,77 @@ _balance_cache: dict = {"value": None, "error": None, "ts": 0.0}
 _monad_balance_cache: dict = {"value": None, "error": None, "ts": 0.0}
 
 
+# Hard per-request RPC ceiling. The cache absorbs sustained traffic; this just
+# guards the cache-miss path against a slow/flaky public RPC. On timeout the
+# old cached value is returned with the error annotated so the dashboard stays
+# responsive instead of bubbling a network error to the browser.
+_RPC_REQUEST_TIMEOUT = 5.0
+
+
 async def _cached_balance() -> tuple[float | None, str | None]:
     if time.time() - _balance_cache["ts"] < _BALANCE_TTL:
         return _balance_cache["value"], _balance_cache["error"]
     try:
-        v = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
+        v = await asyncio.wait_for(
+            get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, WALLET),
+            timeout=_RPC_REQUEST_TIMEOUT,
+        )
         _balance_cache.update({"value": v, "error": None, "ts": time.time()})
         return v, None
     except Exception as e:
-        msg = str(e)
-        _balance_cache.update({"value": None, "error": msg, "ts": time.time()})
-        return None, msg
+        msg = "timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
+        # Don't overwrite a recent good value with a transient error — keep
+        # serving the last-known balance while logging the failure.
+        _balance_cache["error"] = msg
+        _balance_cache["ts"] = time.time()
+        return _balance_cache["value"], msg
 
 
 async def _cached_monad_balance() -> tuple[float | None, str | None]:
     if time.time() - _monad_balance_cache["ts"] < _BALANCE_TTL:
         return _monad_balance_cache["value"], _monad_balance_cache["error"]
     try:
-        v = await get_native_balance(MONAD_RPC_URL, WALLET)
+        v = await asyncio.wait_for(
+            get_native_balance(MONAD_RPC_URL, WALLET),
+            timeout=_RPC_REQUEST_TIMEOUT,
+        )
         _monad_balance_cache.update({"value": v, "error": None, "ts": time.time()})
         return v, None
     except Exception as e:
-        msg = str(e)
-        _monad_balance_cache.update({"value": None, "error": msg, "ts": time.time()})
-        return None, msg
+        msg = "timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
+        _monad_balance_cache["error"] = msg
+        _monad_balance_cache["ts"] = time.time()
+        return _monad_balance_cache["value"], msg
+
+
+# Background rewards refresher — runs every _BALANCE_TTL seconds independent
+# of dashboard requests. Decoupling means a cold-start chain scan (which on
+# Monad's public RPC can take 60-90s for the first run) never blocks the
+# /v1/dashboard-data response, so the user never sees a network error.
+async def _background_rewards_refresher() -> None:
+    while True:
+        try:
+            await rewards_tracker.refresh(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover — defensive
+            log.warning("background rewards refresh failed: %s", e)
+        await asyncio.sleep(_BALANCE_TTL)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_schema()
     log.info("SQLite schema initialised")
-    yield
+    refresher = asyncio.create_task(_background_rewards_refresher())
+    try:
+        yield
+    finally:
+        refresher.cancel()
+        try:
+            await refresher
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -86,6 +127,7 @@ class StatusPayload(BaseModel):
     last_reward_iso: str | None = None
     rewards_today_total: float | None = None
     wins_today: int = 0
+    rewards_logged_today: int = 0
     tps_current: float | None = None
     symbols_current: float | None = None
     max_symbols: float | None = None
@@ -178,13 +220,10 @@ async def dashboard_data():
     s = store.latest
     balance, balance_error = await _cached_balance()
     monad_balance, monad_balance_error = await _cached_monad_balance()
-    # Refresh on-chain rewards summary (30s in-memory cache inside the tracker
-    # — same TTL as the balance cache). Wrapped in try/except so a Monad RPC
-    # blip never blanks the rest of the dashboard.
-    try:
-        await rewards_tracker.refresh(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
-    except Exception as e:  # pragma: no cover — defensive
-        log.warning("rewards tracker refresh failed: %s", e)
+    # Chain-rewards refresh runs in `_background_rewards_refresher` (lifespan
+    # task). Reading the summary is in-memory and instant. First few requests
+    # after a fresh deploy may see empty data until the background task lands
+    # its first successful scan.
     chain_rewards = rewards_tracker.summary()
 
     snapshot_dict = None
@@ -207,6 +246,7 @@ async def dashboard_data():
             "last_reward_iso": s.last_reward_iso,
             "rewards_today_total": s.rewards_today_total,
             "wins_today": s.wins_today,
+            "rewards_logged_today": s.rewards_logged_today,
             "tps_current": s.tps_current,
             "symbols_current": s.symbols_current,
             "max_symbols": s.max_symbols,

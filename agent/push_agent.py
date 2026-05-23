@@ -437,7 +437,12 @@ def get_node_snapshot(
     last_reward: float | None = None
     last_reward_time: str | None = None
     rewards_today_total: float | None = None
-    wins_today = 0
+    # rewards_logged_today = positive-delta pairs (rewards captured inside the
+    # Capsule's ~7-second balance-before/after snapshot window). This is a
+    # subset of participations — rewards that land on-chain outside the
+    # snapshot window aren't counted here (but are visible via chain_rewards
+    # on the bot).
+    rewards_logged_today = 0
 
     parsed: list[dict[str, Any]] = []
     for ln in ext_content.splitlines():
@@ -478,9 +483,14 @@ def get_node_snapshot(
         # Today's totals
         if parsed[i]["date"] == today_utc:
             total_sum += delta
-            wins_today += 1
+            rewards_logged_today += 1
     if total_sum > 0:
         rewards_today_total = round(total_sum, 6)
+
+    # wins_today now mirrors participations — every round the node participated
+    # in counts as a win (rewards land on-chain async, often outside the
+    # Capsule's snapshot window, so a positive-delta count under-reports wins).
+    wins_today = participations
 
     # Model
     model: str | None = None
@@ -558,6 +568,7 @@ def get_node_snapshot(
         "last_reward_iso": last_reward_time,
         "rewards_today_total": rewards_today_total,
         "wins_today": wins_today,
+        "rewards_logged_today": rewards_logged_today,
         "tps_current": tps_current,
         "symbols_current": symbols_current,
         "max_symbols": max_symbols,

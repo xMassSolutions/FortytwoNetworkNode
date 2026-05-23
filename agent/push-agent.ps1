@@ -239,7 +239,11 @@ function Get-NodeSnapshot {
     #   - Sum positive deltas where the after-line's date == today_utc.
     $lastReward = $null; $lastRewardTime = $null
     $rewardsTodayTotal = $null
-    $winsToday = 0
+    # rewardsLoggedToday = positive-delta pairs (rewards captured inside the
+    # Capsule's ~7-second balance-before/after snapshot window). This is a
+    # subset of participations — the rest of the rewards land on-chain
+    # outside the snapshot window and are visible via chain_rewards on the bot.
+    $rewardsLoggedToday = 0
     if (Test-Path $ExtLog) {
         $allBal = Select-String -Path $ExtLog -Pattern "FOR balance (before|after) reward" | ForEach-Object { $_.Line }
         # Build a parsed list: [{ kind, value, date, time, raw }]
@@ -276,11 +280,15 @@ function Get-NodeSnapshot {
             # Today's totals
             if ($parsed[$i].date -eq $todayUtc) {
                 $totalSum += $delta
-                $winsToday += 1
+                $rewardsLoggedToday += 1
             }
         }
         if ($totalSum -gt 0) { $rewardsTodayTotal = [math]::Round($totalSum, 6) }
     }
+    # wins_today now mirrors participations — every round the node participated
+    # in counts as a win (rewards land on-chain async, often outside the
+    # Capsule's snapshot window, so a positive-delta count under-reports wins).
+    $winsToday = $participations
 
     $model = $null; $modelShort = $null
     if (Test-Path $CapsuleLog) {
@@ -364,6 +372,7 @@ function Get-NodeSnapshot {
         last_reward_iso             = $lastRewardTime
         rewards_today_total         = $rewardsTodayTotal
         wins_today                  = $winsToday
+        rewards_logged_today        = $rewardsLoggedToday
         tps_current                 = $tpsCurrent
         symbols_current             = $symbolsCurrent
         max_symbols                 = $maxSymbols

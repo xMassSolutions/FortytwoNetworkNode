@@ -294,18 +294,21 @@ async function refresh(){
     renderNodeCard(s);
 
     const participated = s.rounds_participated_today || 0;
-    const wins = s.wins_today || 0;
-    const losses = Math.max(participated - wins, 0);
-    const wlRow = participated > 0
-      ? row('W / L', `<span style="color:var(--green)">${wins}</span> / <span style="color:var(--red)">${losses}</span>`)
-        + row('Win rate', `${Math.round(wins / participated * 100)}%`)
+    // wins_today now mirrors participations on the agent side. rewards_logged_today
+    // = positive-delta balance pairs (rewards captured in the Capsule's ~7-sec
+    // snapshot window). Shown as a diagnostic for how many rewards were caught
+    // in-window — the chain_rewards.transfers_today on the FOR card is the
+    // authoritative total.
+    const loggedRewards = s.rewards_logged_today || 0;
+    const loggedRow = participated > 0
+      ? row('Rewarded (log)', `<span style="color:var(--muted)">${loggedRewards} / ${participated} in-snapshot</span>`)
       : '';
 
     document.getElementById('today-content').innerHTML =
         row('Participated', `<strong style="font-size:18px">${participated}</strong>`)
       + row('Observed', s.rounds_observed_today)
       + row('Errors', s.errors_today)
-      + wlRow
+      + loggedRow
       + row('First round', s.first_round_today_iso||'—')
       + row('Last round', `${s.last_round_today_iso||'—'} <span style="color:var(--muted)">${s.last_round_duration_s?s.last_round_duration_s+'s':''}</span>`);
 

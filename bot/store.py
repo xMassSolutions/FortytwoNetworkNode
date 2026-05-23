@@ -22,6 +22,11 @@ class Snapshot:
     last_reward_iso: str | None = None
     rewards_today_total: float | None = None
     wins_today: int = 0
+    # Count of `Participant's FOR balance before/after reward` pairs today
+    # where after > before — i.e., rewards that landed inside the Capsule's
+    # ~7-second snapshot window. wins_today now mirrors participations; this
+    # field is the diagnostic for how many rewards were captured in-window.
+    rewards_logged_today: int = 0
     tps_current: float | None = None
     symbols_current: float | None = None
     max_symbols: float | None = None
