@@ -135,6 +135,55 @@ def get_log_tail(path: Path, n: int = 100) -> list[str]:
         return []
 
 
+# ---------- GPU info ----------
+
+
+def get_gpu_info() -> dict[str, Any]:
+    """Primary path: nvidia-smi (FortyTwo node = LLM inference = typically NVIDIA).
+
+    Returns {"name": str|None, "used": int|None, "total": int|None} in MB.
+    macOS fallback: system_profiler gives the chipset name only (no VRAM usage
+    CLI without paid tools).
+    """
+    out: dict[str, Any] = {"name": None, "used": None, "total": None}
+    try:
+        r = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            first = r.stdout.strip().splitlines()[0]
+            parts = [p.strip() for p in first.split(",")]
+            if len(parts) >= 3:
+                out["name"] = parts[0]
+                out["used"] = int(parts[1])
+                out["total"] = int(parts[2])
+    except Exception:
+        pass
+    if not out["name"]:
+        try:
+            r = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("Chipset Model:"):
+                    out["name"] = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+    return out
+
+
 # ---------- parsing helpers ----------
 
 # Matches today's "UTC YYYY-MM-DD ..." line prefix; we accept a flexible date.
@@ -389,6 +438,8 @@ def get_node_snapshot(scripts_root: Path, history_file: Path) -> dict[str, Any]:
     capsule_alive = capsule_ready()
     protocol_alive = proto_pid is not None
 
+    gpu = get_gpu_info()
+
     rounds_history = update_rounds_history(all_today, today_utc, history_file)
     log_extended = get_log_tail(ext_log, 100)
     log_capsule = get_log_tail(capsule_log, 100)
@@ -414,6 +465,9 @@ def get_node_snapshot(scripts_root: Path, history_file: Path) -> dict[str, Any]:
         "tps_current": tps_current,
         "symbols_current": symbols_current,
         "max_symbols": max_symbols,
+        "gpu_name": gpu["name"],
+        "gpu_vram_used_mb": gpu["used"],
+        "gpu_vram_total_mb": gpu["total"],
         "capsule_pid": cap_pid,
         "protocol_pid": proto_pid,
         "capsule_alive": capsule_alive,
@@ -480,7 +534,7 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
 
     last_pos = ext_log.stat().st_size if ext_log.exists() else 0
 
-    heartbeat_seconds = 10 * 60
+    heartbeat_seconds = 30
     poll_interval = 5
 
     while True:

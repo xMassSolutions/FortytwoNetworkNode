@@ -53,7 +53,7 @@ a { color: var(--blue); text-decoration: none; }
     <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
     <div class="card">
       <div class="section-header" style="margin-bottom:12px">
-        <h2 style="margin-bottom:0">Node</h2>
+        <h2 id="node-title" style="margin-bottom:0">Node</h2>
         <span class="toggle-group">
           <button class="toggle-btn active" data-tps="actual">Actual</button>
           <button class="toggle-btn" data-tps="max">Max</button>
@@ -120,7 +120,7 @@ a { color: var(--blue); text-decoration: none; }
     </table>
   </div>
 
-  <footer>Auto-refresh every 3m · <span id="updated"></span></footer>
+  <footer>Auto-refresh every 5s · <span id="updated"></span></footer>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
@@ -235,12 +235,25 @@ function renderTpsRows(s){
 }
 
 function renderNodeCard(s){
+  const titleEl = document.getElementById('node-title');
   const el = document.getElementById('node-content');
-  if (!s) { el.innerHTML = row('Status', '<span class="badge down">No data</span>'); return; }
-  const alive = (s.capsule_alive && s.protocol_alive) ? '<span class="badge ok">ALIVE</span>' : '<span class="badge down">DOWN</span>';
+  if (!s) {
+    if (titleEl) titleEl.style.color = '';
+    el.innerHTML = row('Status', '<span class="badge down">No data</span>');
+    return;
+  }
+  const alive = s.capsule_alive && s.protocol_alive;
+  if (titleEl) titleEl.style.color = alive ? 'var(--green)' : 'var(--red)';
+
+  const gpuName = s.gpu_name || '—';
+  const vram = (s.gpu_vram_used_mb != null && s.gpu_vram_total_mb)
+    ? `${(s.gpu_vram_used_mb/1024).toFixed(1)} GB / ${(s.gpu_vram_total_mb/1024).toFixed(1)} GB`
+    : '—';
+
   el.innerHTML =
-      row('Status', alive)
-    + row('Model', `<span style="font-size:11px">${s.model_short||'—'}</span>`)
+      row('Model', `<span style="font-size:11px">${s.model_short||'—'}</span>`)
+    + row('GPU', `<span style="font-size:12px">${escapeHtml(gpuName)}</span>`)
+    + row('VRAM', vram)
     + renderTpsRows(s)
     + row('Capsule', `${s.capsule_version||'—'} <span style="color:var(--muted)">PID ${s.capsule_pid||'—'}</span>`)
     + row('Protocol', `${s.protocol_version||'—'} <span style="color:var(--muted)">PID ${s.protocol_pid||'—'}</span>`)
@@ -385,8 +398,29 @@ document.querySelectorAll('.toggle-btn[data-tps]').forEach(btn => {
 
 refresh();
 refreshWallets();
-setInterval(refresh, 180000);
-setInterval(refreshWallets, 180000);
+let refreshTimer = null;
+let walletsTimer = null;
+
+function startTimers() {
+  if (!refreshTimer)  refreshTimer  = setInterval(refresh, 5000);
+  if (!walletsTimer)  walletsTimer  = setInterval(refreshWallets, 30000);
+}
+function stopTimers() {
+  if (refreshTimer) { clearInterval(refreshTimer);  refreshTimer  = null; }
+  if (walletsTimer) { clearInterval(walletsTimer);  walletsTimer  = null; }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopTimers();
+  } else {
+    refresh();
+    refreshWallets();
+    startTimers();
+  }
+});
+
+startTimers();
 </script>
 </body>
 </html>

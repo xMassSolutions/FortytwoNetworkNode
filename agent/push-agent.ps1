@@ -82,6 +82,31 @@ function Get-LogTail($path, $n = 100) {
     return ,$result.ToArray()
 }
 
+function Get-GpuInfo {
+    # Primary path: nvidia-smi (FortyTwo node = LLM inference = typically NVIDIA)
+    $gpuName = $null; $vramUsed = $null; $vramTotal = $null
+    try {
+        $out = & nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader,nounits 2>$null
+        if ($LASTEXITCODE -eq 0 -and $out) {
+            $first = ($out -split "`n")[0]
+            $parts = $first -split ',\s*'
+            if ($parts.Count -ge 3) {
+                $gpuName   = $parts[0].Trim()
+                $vramUsed  = [int]$parts[1].Trim()
+                $vramTotal = [int]$parts[2].Trim()
+            }
+        }
+    } catch { }
+    # Fallback: WMI for the name on non-NVIDIA boxes (VRAM via WMI is unreliable)
+    if (-not $gpuName) {
+        try {
+            $g = Get-CimInstance Win32_VideoController -ErrorAction Stop | Select-Object -First 1
+            if ($g) { $gpuName = $g.Name }
+        } catch { }
+    }
+    return @{ name = $gpuName; used = $vramUsed; total = $vramTotal }
+}
+
 function Get-NodeSnapshot {
     $todayUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
 
@@ -245,6 +270,9 @@ function Get-NodeSnapshot {
     # Rolling 30-day rounds history (persisted to rounds-history.json next to this script)
     $roundsHistory = Update-RoundsHistory $allToday $todayUtc $RoundsHistoryFile
 
+    # GPU + VRAM (nvidia-smi primary, WMI fallback for name only)
+    $gpu = Get-GpuInfo
+
     # Tail last 100 lines of each log
     $logExtended = Get-LogTail $ExtLog 100
     $logCapsule  = Get-LogTail $CapsuleLog 100
@@ -270,6 +298,9 @@ function Get-NodeSnapshot {
         tps_current                 = $tpsCurrent
         symbols_current             = $symbolsCurrent
         max_symbols                 = $maxSymbols
+        gpu_name                    = $gpu.name
+        gpu_vram_used_mb            = $gpu.used
+        gpu_vram_total_mb           = $gpu.total
         capsule_pid                 = $capPid
         protocol_pid                = $protoPid
         capsule_alive               = $capsuleAlive
@@ -325,7 +356,7 @@ try {
 # Initial file position: skip existing content, only push on NEW events
 $lastPos = if (Test-Path $ExtLog) { (Get-Item $ExtLog).Length } else { 0 }
 
-$HeartbeatMinutes    = 10
+$HeartbeatSeconds    = 30
 $PollIntervalSeconds = 5
 $EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
 
@@ -333,7 +364,7 @@ while ($true) {
     Start-Sleep -Seconds $PollIntervalSeconds
 
     # 10-min heartbeat (so bot snapshots survive its redeploys / silent periods)
-    if (((Get-Date) - $lastPushTime).TotalMinutes -ge $HeartbeatMinutes) {
+    if (((Get-Date) - $lastPushTime).TotalSeconds -ge $HeartbeatSeconds) {
         $now = Get-Date -Format "HH:mm:ss"
         Write-Output "[$now] heartbeat push"
         try {

@@ -25,6 +25,9 @@ class Snapshot:
     tps_current: float | None = None
     symbols_current: float | None = None
     max_symbols: float | None = None
+    gpu_name: str | None = None
+    gpu_vram_used_mb: int | None = None
+    gpu_vram_total_mb: int | None = None
     capsule_pid: int | None = None
     protocol_pid: int | None = None
     capsule_alive: bool = False

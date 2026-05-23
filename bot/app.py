@@ -24,6 +24,24 @@ WALLET = os.environ["WALLET"]
 FOR_CONTRACT = os.environ.get("FOR_CONTRACT", "0xf6B888f442277F01294F94D555608A2E8Bc86430")
 MONAD_RPC_URL = os.environ.get("MONAD_RPC_URL", "https://testnet-rpc.monad.xyz/")
 
+# Balance cache — at 5s dashboard refresh × N viewers, hitting Monad RPC every
+# request gets us rate-limited. Cache the operator wallet balance for 30s.
+_BALANCE_TTL = 30.0
+_balance_cache: dict = {"value": None, "error": None, "ts": 0.0}
+
+
+async def _cached_balance() -> tuple[float | None, str | None]:
+    if time.time() - _balance_cache["ts"] < _BALANCE_TTL:
+        return _balance_cache["value"], _balance_cache["error"]
+    try:
+        v = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
+        _balance_cache.update({"value": v, "error": None, "ts": time.time()})
+        return v, None
+    except Exception as e:
+        msg = str(e)
+        _balance_cache.update({"value": None, "error": msg, "ts": time.time()})
+        return None, msg
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -56,6 +74,9 @@ class StatusPayload(BaseModel):
     tps_current: float | None = None
     symbols_current: float | None = None
     max_symbols: float | None = None
+    gpu_name: str | None = None
+    gpu_vram_used_mb: int | None = None
+    gpu_vram_total_mb: int | None = None
     capsule_pid: int | None = None
     protocol_pid: int | None = None
     capsule_alive: bool = False
@@ -140,12 +161,7 @@ async def list_wallets():
 @app.get("/v1/dashboard-data")
 async def dashboard_data():
     s = store.latest
-    balance = None
-    balance_error = None
-    try:
-        balance = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
-    except Exception as e:
-        balance_error = str(e)
+    balance, balance_error = await _cached_balance()
 
     snapshot_dict = None
     if s:
@@ -170,6 +186,9 @@ async def dashboard_data():
             "tps_current": s.tps_current,
             "symbols_current": s.symbols_current,
             "max_symbols": s.max_symbols,
+            "gpu_name": s.gpu_name,
+            "gpu_vram_used_mb": s.gpu_vram_used_mb,
+            "gpu_vram_total_mb": s.gpu_vram_total_mb,
             "capsule_pid": s.capsule_pid,
             "protocol_pid": s.protocol_pid,
             "capsule_alive": s.capsule_alive,
