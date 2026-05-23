@@ -205,8 +205,9 @@ UTC_PREFIX_RE = re.compile(r"^UTC \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s*")
 DURATION_RE = re.compile(r"(\d{2}:\d{2}:\d{2}).*Total time: (\d+)s")
 
 BALANCE_LINE_RE = re.compile(r"FOR balance (before|after) reward")
-BAL_BEFORE_RE = re.compile(r"balance before reward: (\d+\.?\d*)")
-BAL_AFTER_RE = re.compile(r"balance after reward: (\d+\.?\d*)")
+BAL_BEFORE_RE = re.compile(r"balance before reward:\s*(\d+\.?\d*)")
+BAL_AFTER_RE = re.compile(r"balance after reward:\s*(\d+\.?\d*)")
+BAL_DATETIME_RE = re.compile(r"UTC (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})")
 
 CAPABILITY_LINE_RE = re.compile(
     r"has max tokens per second:\s*(\d+),?\s*max symbols per second:\s*(\d+)"
@@ -421,45 +422,65 @@ def get_node_snapshot(
         tps_current = float(last.group(1))
         symbols_current = float(last.group(2))
 
-    # Most recent positive reward (whole-file scan, last 200 balance lines)
+    # Reward parser — full-file scan + windowed pairing.
+    # Why: the old filter on today_lines (lines starting with ^UTC YYYY-MM-DD)
+    # dropped any balance line that didn't have that prefix, and the strict
+    # consecutive-pair loop desynced permanently the moment ONE line was lost.
+    # Both undercounted wins_today / rewards_today_total.
+    # New approach:
+    #   - Scan the whole file for ALL balance lines (no prefix filter).
+    #   - For each, extract date + time from `UTC YYYY-MM-DD HH:MM:SS`
+    #     anywhere in the line (lines without that pattern are skipped).
+    #   - Pair each `after` with the nearest preceding `before` within
+    #     a 5-line window.
+    #   - Sum positive deltas where the after-line's date == today_utc.
     last_reward: float | None = None
     last_reward_time: str | None = None
-    bal_lines_all = [m.group(0) for m in re.finditer(r"^.*FOR balance (before|after) reward.*$", ext_content, re.MULTILINE)]
-    bal_lines_all = bal_lines_all[-200:]
-    for i in range(len(bal_lines_all) - 1, 0, -1):
-        after_ln = bal_lines_all[i]
-        before_ln = bal_lines_all[i - 1]
-        m_after = BAL_AFTER_RE.search(after_ln)
-        m_before = BAL_BEFORE_RE.search(before_ln)
-        if m_after and m_before:
-            after_val = float(m_after.group(1))
-            before_val = float(m_before.group(1))
-            if after_val > before_val:
-                last_reward = round(after_val - before_val, 6)
-                m_t = TIME_HMS_RE.search(after_ln)
-                if m_t:
-                    last_reward_time = m_t.group(1)
-                break
-
-    # Sum + count of positive reward deltas in today's log
     rewards_today_total: float | None = None
     wins_today = 0
-    today_bal_lines = [ln for ln in today_lines if BALANCE_LINE_RE.search(ln)]
-    if len(today_bal_lines) >= 2:
-        total_sum = 0.0
-        for i in range(1, len(today_bal_lines)):
-            before_ln = today_bal_lines[i - 1]
-            after_ln = today_bal_lines[i]
-            m_before = BAL_BEFORE_RE.search(before_ln)
-            m_after = BAL_AFTER_RE.search(after_ln)
-            if m_before and m_after:
-                before_val = float(m_before.group(1))
-                after_val = float(m_after.group(1))
-                if after_val > before_val:
-                    total_sum += after_val - before_val
-                    wins_today += 1
-        if total_sum > 0:
-            rewards_today_total = round(total_sum, 6)
+
+    parsed: list[dict[str, Any]] = []
+    for ln in ext_content.splitlines():
+        m_bef = BAL_BEFORE_RE.search(ln)
+        m_aft = BAL_AFTER_RE.search(ln)
+        if m_bef:
+            kind, value = "before", float(m_bef.group(1))
+        elif m_aft:
+            kind, value = "after", float(m_aft.group(1))
+        else:
+            continue
+        m_dt = BAL_DATETIME_RE.search(ln)
+        date = m_dt.group(1) if m_dt else None
+        time_str = m_dt.group(2) if m_dt else None
+        parsed.append({"kind": kind, "value": value, "date": date, "time": time_str})
+
+    total_sum = 0.0
+    for i in range(len(parsed)):
+        if parsed[i]["kind"] != "after":
+            continue
+        after_val = parsed[i]["value"]
+        before_val: float | None = None
+        lookback = max(0, i - 5)
+        for j in range(i - 1, lookback - 1, -1):
+            if parsed[j]["kind"] == "before":
+                before_val = parsed[j]["value"]
+                break
+        if before_val is None or after_val <= before_val:
+            continue
+        delta = after_val - before_val
+        # Only trust deltas with a parseable date — otherwise the line may be
+        # a stray fragment and would pollute last_reward.
+        if not parsed[i]["date"]:
+            continue
+        # Last reward — most recent dated positive delta (across all dates).
+        last_reward = round(delta, 6)
+        last_reward_time = parsed[i]["time"]
+        # Today's totals
+        if parsed[i]["date"] == today_utc:
+            total_sum += delta
+            wins_today += 1
+    if total_sum > 0:
+        rewards_today_total = round(total_sum, 6)
 
     # Model
     model: str | None = None

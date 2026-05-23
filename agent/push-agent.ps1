@@ -225,42 +225,58 @@ function Get-NodeSnapshot {
         }
     }
 
-    # Find the most recent POSITIVE reward (Protocol logs balance pairs even when delta is 0)
+    # Reward parser — full-file scan + windowed pairing.
+    # Why: the old `$todayLines` filter dropped any balance line that didn't
+    # start with `UTC YYYY-MM-DD`, and the strict consecutive-pair loop
+    # desynced permanently the moment ONE line was lost. Both undercounted
+    # wins_today / rewards_today_total.
+    # New approach:
+    #   - Scan the whole file for ALL balance lines (no prefix filter).
+    #   - For each, extract date + time from `UTC YYYY-MM-DD HH:MM:SS`
+    #     anywhere in the line (lines without that pattern are skipped).
+    #   - Pair each `after` with the nearest preceding `before` within
+    #     a 5-line window.
+    #   - Sum positive deltas where the after-line's date == today_utc.
     $lastReward = $null; $lastRewardTime = $null
-    if (Test-Path $ExtLog) {
-        $balanceLines = Select-String -Path $ExtLog -Pattern "FOR balance (before|after) reward" | Select-Object -Last 200
-        # Walk in pairs from newest to oldest; first pair with after > before wins
-        for ($i = $balanceLines.Count - 1; $i -ge 1; $i--) {
-            $after = $balanceLines[$i].Line
-            $before = $balanceLines[$i-1].Line
-            if ($after -match "balance after reward: (\d+\.?\d*)" -and $before -match "balance before reward: (\d+\.?\d*)") {
-                $afterVal  = [double]([regex]::Match($after,  "balance after reward: (\d+\.?\d*)").Groups[1].Value)
-                $beforeVal = [double]([regex]::Match($before, "balance before reward: (\d+\.?\d*)").Groups[1].Value)
-                if ($afterVal -gt $beforeVal) {
-                    $lastReward = [math]::Round($afterVal - $beforeVal, 6)
-                    if ($after -match "(\d{2}:\d{2}:\d{2})") { $lastRewardTime = $matches[1] }
-                    break
-                }
-            }
-        }
-    }
-
-    # Sum + count of positive reward deltas in today's log
     $rewardsTodayTotal = $null
     $winsToday = 0
-    $todayBalanceLines = @($todayLines | Where-Object { $_ -match "FOR balance (before|after) reward" })
-    if ($todayBalanceLines.Count -ge 2) {
+    if (Test-Path $ExtLog) {
+        $allBal = Select-String -Path $ExtLog -Pattern "FOR balance (before|after) reward" | ForEach-Object { $_.Line }
+        # Build a parsed list: [{ kind, value, date, time, raw }]
+        $parsed = New-Object System.Collections.ArrayList
+        foreach ($ln in $allBal) {
+            $kind = $null; $value = $null; $date = $null; $time = $null
+            if     ($ln -match "balance before reward:\s*(\d+\.?\d*)") { $kind = "before"; $value = [double]$matches[1] }
+            elseif ($ln -match "balance after reward:\s*(\d+\.?\d*)")  { $kind = "after";  $value = [double]$matches[1] }
+            else { continue }
+            if ($ln -match "UTC (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})") {
+                $date = $matches[1]; $time = $matches[2]
+            }
+            [void]$parsed.Add([pscustomobject]@{ kind=$kind; value=$value; date=$date; time=$time; raw=$ln })
+        }
+
         $totalSum = 0.0
-        for ($i = 1; $i -lt $todayBalanceLines.Count; $i++) {
-            $before = $todayBalanceLines[$i-1]
-            $after  = $todayBalanceLines[$i]
-            if ($before -match "balance before reward: (\d+\.?\d*)" -and $after -match "balance after reward: (\d+\.?\d*)") {
-                $beforeVal = [double]([regex]::Match($before, "balance before reward: (\d+\.?\d*)").Groups[1].Value)
-                $afterVal  = [double]([regex]::Match($after,  "balance after reward: (\d+\.?\d*)").Groups[1].Value)
-                if ($afterVal -gt $beforeVal) {
-                    $totalSum += ($afterVal - $beforeVal)
-                    $winsToday += 1
-                }
+        for ($i = 0; $i -lt $parsed.Count; $i++) {
+            if ($parsed[$i].kind -ne "after") { continue }
+            $afterVal = $parsed[$i].value
+            $beforeVal = $null
+            $lookback = [Math]::Max(0, $i - 5)
+            for ($j = $i - 1; $j -ge $lookback; $j--) {
+                if ($parsed[$j].kind -eq "before") { $beforeVal = $parsed[$j].value; break }
+            }
+            if ($null -eq $beforeVal) { continue }
+            if ($afterVal -le $beforeVal) { continue }
+            # Only trust deltas with a parseable date — otherwise the line may
+            # be a stray fragment and would pollute lastReward.
+            if (-not $parsed[$i].date) { continue }
+            $delta = $afterVal - $beforeVal
+            # Last reward — most recent dated positive delta (across all dates).
+            $lastReward = [math]::Round($delta, 6)
+            $lastRewardTime = $parsed[$i].time
+            # Today's totals
+            if ($parsed[$i].date -eq $todayUtc) {
+                $totalSum += $delta
+                $winsToday += 1
             }
         }
         if ($totalSum -gt 0) { $rewardsTodayTotal = [math]::Round($totalSum, 6) }

@@ -316,11 +316,17 @@ async function refresh(){
   }
 
   if(data.balance!=null){
+    // Chain-derived numbers (authoritative for FOR earned / last reward).
+    // The agent's s.rewards_today_total/last_reward_amount under-report because
+    // the Capsule log doesn't see observer/periodic distributions — chain does.
+    const cr = data.chain_rewards || {};
+    const lastIso = cr.last_transfer_iso ? cr.last_transfer_iso.slice(11,19) : null;
     document.getElementById('balance-content').innerHTML =
       `<div class="balance-big">${fmtNum(data.balance)} <span style="color:var(--muted);font-size:14px;font-weight:400">FOR</span></div>`
-      + (s && s.rewards_today_total ? `<div class="balance-reward">+${fmtNum(s.rewards_today_total)} FOR earned today</div>` : '')
+      + (cr.earned_today ? `<div class="balance-reward">+${fmtNum(cr.earned_today)} FOR earned today</div>` : '')
+      + (cr.transfers_today ? `<div class="balance-reward" style="color:var(--muted)">${cr.transfers_today} distributions today</div>` : '')
       + (s && s.wins_today ? `<div class="balance-reward" style="color:var(--muted)">${s.wins_today} wins today</div>` : '')
-      + (s && s.last_reward_amount ? `<div class="balance-reward" style="color:var(--muted)">last +${fmtNum(s.last_reward_amount)} FOR at ${s.last_reward_iso||'—'} UTC</div>` : '');
+      + (cr.last_transfer_amount ? `<div class="balance-reward" style="color:var(--muted)">last +${fmtNum(cr.last_transfer_amount)} FOR at ${lastIso||'—'} UTC</div>` : '');
   } else {
     document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${data.balance_error||'unknown'}</div>`;
   }

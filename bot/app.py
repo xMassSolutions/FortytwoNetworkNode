@@ -11,6 +11,7 @@ import wallets as wstore
 from chain import get_for_balance, get_native_balance
 from dashboard_html import DASHBOARD_HTML
 from db import init_schema
+from rewards import tracker as rewards_tracker
 from store import Snapshot, store
 
 log = logging.getLogger("bot")
@@ -162,6 +163,14 @@ async def list_wallets():
 async def dashboard_data():
     s = store.latest
     balance, balance_error = await _cached_balance()
+    # Refresh on-chain rewards summary (30s in-memory cache inside the tracker
+    # — same TTL as the balance cache). Wrapped in try/except so a Monad RPC
+    # blip never blanks the rest of the dashboard.
+    try:
+        await rewards_tracker.refresh(MONAD_RPC_URL, FOR_CONTRACT, WALLET)
+    except Exception as e:  # pragma: no cover — defensive
+        log.warning("rewards tracker refresh failed: %s", e)
+    chain_rewards = rewards_tracker.summary()
 
     snapshot_dict = None
     if s:
@@ -204,6 +213,7 @@ async def dashboard_data():
         "snapshot": snapshot_dict,
         "balance": balance,
         "balance_error": balance_error,
+        "chain_rewards": chain_rewards,
         "wallet": WALLET,
         "wallet_short": f"{WALLET[:6]}…{WALLET[-4:]}",
     })
