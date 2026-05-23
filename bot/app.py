@@ -26,9 +26,10 @@ FOR_CONTRACT = os.environ.get("FOR_CONTRACT", "0xf6B888f442277F01294F94D555608A2
 MONAD_RPC_URL = os.environ.get("MONAD_RPC_URL", "https://testnet-rpc.monad.xyz/")
 
 # Balance cache — at 5s dashboard refresh × N viewers, hitting Monad RPC every
-# request gets us rate-limited. Cache the operator wallet balance for 30s.
+# request gets us rate-limited. Cache the operator wallet balances for 30s.
 _BALANCE_TTL = 30.0
 _balance_cache: dict = {"value": None, "error": None, "ts": 0.0}
+_monad_balance_cache: dict = {"value": None, "error": None, "ts": 0.0}
 
 
 async def _cached_balance() -> tuple[float | None, str | None]:
@@ -41,6 +42,19 @@ async def _cached_balance() -> tuple[float | None, str | None]:
     except Exception as e:
         msg = str(e)
         _balance_cache.update({"value": None, "error": msg, "ts": time.time()})
+        return None, msg
+
+
+async def _cached_monad_balance() -> tuple[float | None, str | None]:
+    if time.time() - _monad_balance_cache["ts"] < _BALANCE_TTL:
+        return _monad_balance_cache["value"], _monad_balance_cache["error"]
+    try:
+        v = await get_native_balance(MONAD_RPC_URL, WALLET)
+        _monad_balance_cache.update({"value": v, "error": None, "ts": time.time()})
+        return v, None
+    except Exception as e:
+        msg = str(e)
+        _monad_balance_cache.update({"value": None, "error": msg, "ts": time.time()})
         return None, msg
 
 
@@ -163,6 +177,7 @@ async def list_wallets():
 async def dashboard_data():
     s = store.latest
     balance, balance_error = await _cached_balance()
+    monad_balance, monad_balance_error = await _cached_monad_balance()
     # Refresh on-chain rewards summary (30s in-memory cache inside the tracker
     # — same TTL as the balance cache). Wrapped in try/except so a Monad RPC
     # blip never blanks the rest of the dashboard.
@@ -213,6 +228,8 @@ async def dashboard_data():
         "snapshot": snapshot_dict,
         "balance": balance,
         "balance_error": balance_error,
+        "monad_balance": monad_balance,
+        "monad_balance_error": monad_balance_error,
         "chain_rewards": chain_rewards,
         "wallet": WALLET,
         "wallet_short": f"{WALLET[:6]}…{WALLET[-4:]}",

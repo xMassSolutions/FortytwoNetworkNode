@@ -316,17 +316,31 @@ async function refresh(){
   }
 
   if(data.balance!=null){
-    // Chain-derived numbers (authoritative for FOR earned / last reward).
-    // The agent's s.rewards_today_total/last_reward_amount under-report because
-    // the Capsule log doesn't see observer/periodic distributions — chain does.
+    // Earned today + last reward: prefer chain-derived (authoritative for
+    // total payouts to the wallet, including observer/periodic distributions
+    // the Capsule log doesn't record). Fall back to the agent's log-derived
+    // values if the chain scan is empty or errored — better to show a slightly
+    // low number than to show nothing.
     const cr = data.chain_rewards || {};
-    const lastIso = cr.last_transfer_iso ? cr.last_transfer_iso.slice(11,19) : null;
+    const usingChain = !!(cr.earned_today && !cr.error);
+    const earned = usingChain ? cr.earned_today : (s && s.rewards_today_total);
+    const earnedSource = usingChain ? '' : ' <span style="color:var(--muted);font-size:10px">(agent estimate)</span>';
+    const lastAmt = usingChain ? cr.last_transfer_amount : (s && s.last_reward_amount);
+    const lastIso = usingChain
+      ? (cr.last_transfer_iso ? cr.last_transfer_iso.slice(11,19) : null)
+      : (s && s.last_reward_iso);
+
+    const monadStr = data.monad_balance != null
+      ? `${Number(data.monad_balance).toFixed(4)} MON`
+      : (data.monad_balance_error ? '<span style="color:var(--red)">MON RPC err</span>' : null);
+
     document.getElementById('balance-content').innerHTML =
       `<div class="balance-big">${fmtNum(data.balance)} <span style="color:var(--muted);font-size:14px;font-weight:400">FOR</span></div>`
-      + (cr.earned_today ? `<div class="balance-reward">+${fmtNum(cr.earned_today)} FOR earned today</div>` : '')
+      + (monadStr ? `<div class="balance-reward" style="color:var(--muted)">${monadStr}</div>` : '')
+      + (earned ? `<div class="balance-reward">+${fmtNum(earned)} FOR earned today${earnedSource}</div>` : '')
       + (cr.transfers_today ? `<div class="balance-reward" style="color:var(--muted)">${cr.transfers_today} distributions today</div>` : '')
       + (s && s.wins_today ? `<div class="balance-reward" style="color:var(--muted)">${s.wins_today} wins today</div>` : '')
-      + (cr.last_transfer_amount ? `<div class="balance-reward" style="color:var(--muted)">last +${fmtNum(cr.last_transfer_amount)} FOR at ${lastIso||'—'} UTC</div>` : '');
+      + (lastAmt ? `<div class="balance-reward" style="color:var(--muted)">last +${fmtNum(lastAmt)} FOR at ${lastIso||'—'} UTC</div>` : '');
   } else {
     document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${data.balance_error||'unknown'}</div>`;
   }

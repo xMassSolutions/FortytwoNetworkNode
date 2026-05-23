@@ -32,7 +32,14 @@ from chain import (
 )
 
 _TTL_SECONDS = 30.0
-_CHUNK_SIZE = 1000  # eth_getLogs block-range cap per request
+# Monad's public testnet RPC (https://testnet-rpc.monad.xyz/) returns
+# `413 Request Entity Too Large` on eth_getLogs over wide ranges. 100 blocks
+# is the safe upper bound we've observed. If you point MONAD_RPC_URL at a paid
+# provider (Alchemy, BlockVision, etc.) you can bump this without code changes.
+_CHUNK_SIZE = 100
+_MIN_CHUNK_SIZE = 5  # halving floor on retry — below this we skip the chunk
+# Per-request cap when fanning out blockNumber → timestamp lookups
+_MAX_BLOCK_TS_LOOKUPS_PER_CHUNK = 50
 
 
 def _utc_today_str() -> str:
@@ -118,6 +125,35 @@ class RewardsTracker:
                 high = mid
         return low
 
+    async def _fetch_chunk_with_halving(
+        self, rpc_url: str, for_contract: str, wallet: str,
+        cursor: int, chunk_end: int,
+    ) -> tuple[list[dict], int, str | None]:
+        """Try eth_getLogs over [cursor, chunk_end]. On 413 or timeout, halve
+        the range and retry, down to `_MIN_CHUNK_SIZE`. Returns
+        (events, last_block_actually_scanned, error_or_None).
+        """
+        attempt_end = chunk_end
+        last_err: str | None = None
+        while attempt_end >= cursor:
+            try:
+                events = await get_transfer_events(
+                    rpc_url, for_contract, [wallet], cursor, attempt_end
+                )
+                return events, attempt_end, None
+            except Exception as e:
+                msg = str(e)
+                last_err = f"{type(e).__name__}: {msg}"
+                # Halve only on size-related errors; bail on other errors.
+                if "413" not in msg and "Too Large" not in msg and "timeout" not in msg.lower():
+                    return [], cursor - 1, last_err
+                span = attempt_end - cursor + 1
+                if span <= _MIN_CHUNK_SIZE:
+                    # Give up on this chunk; skip past it so we make progress next refresh.
+                    return [], attempt_end, last_err
+                attempt_end = cursor + (span // 2) - 1
+        return [], cursor - 1, last_err
+
     async def refresh(self, rpc_url: str, for_contract: str, wallet: str) -> None:
         now = time.time()
         today = _utc_today_str()
@@ -143,21 +179,45 @@ class RewardsTracker:
                 self.last_error = None
                 return
 
-            # Chunk to respect eth_getLogs range limits.
+            # Chunk to respect eth_getLogs range limits. Each successful chunk
+            # advances `last_scanned_block` so partial progress sticks across
+            # refreshes — a 413 on the 5th chunk doesn't lose the first 4.
+            chunk_err: str | None = None
             cursor = from_block
             while cursor <= latest:
                 chunk_end = min(cursor + _CHUNK_SIZE - 1, latest)
-                events = await get_transfer_events(
-                    rpc_url, for_contract, [wallet], cursor, chunk_end
+                events, advanced_to, err = await self._fetch_chunk_with_halving(
+                    rpc_url, for_contract, wallet, cursor, chunk_end,
                 )
-                # Annotate with block timestamp (one extra RPC per unique block).
+                if err and not events:
+                    chunk_err = err
+                    if advanced_to >= cursor:
+                        # We gave up on this range — skip past it.
+                        self.last_scanned_block = advanced_to
+                        cursor = advanced_to + 1
+                        continue
+                    # Couldn't make progress at all → bail out for this refresh.
+                    break
+
+                # Annotate with block timestamp (one extra RPC per unique block,
+                # capped per chunk so a transfer-heavy block range can't blow
+                # out the per-request budget).
                 seen_block_ts: dict[int, int] = {}
+                ts_lookups = 0
                 for ev in events:
                     bn = ev["block_number"]
                     if bn not in seen_block_ts:
-                        seen_block_ts[bn] = await get_block_timestamp(rpc_url, bn)
+                        if ts_lookups >= _MAX_BLOCK_TS_LOOKUPS_PER_CHUNK:
+                            # Skip the timestamp lookup; approximate from chunk_end
+                            # block time (close enough for "today" filtering).
+                            seen_block_ts[bn] = self.today_midnight_ts or 0
+                        else:
+                            try:
+                                seen_block_ts[bn] = await get_block_timestamp(rpc_url, bn)
+                                ts_lookups += 1
+                            except Exception:
+                                seen_block_ts[bn] = self.today_midnight_ts or 0
                     ts = seen_block_ts[bn]
-                    # Defensive: only include if >= midnight (block at boundary).
                     if ts < (self.today_midnight_ts or 0):
                         continue
                     self.today_transfers.append(
@@ -169,13 +229,15 @@ class RewardsTracker:
                             ts=ts,
                         )
                     )
-                self.last_scanned_block = chunk_end
-                cursor = chunk_end + 1
+                self.last_scanned_block = advanced_to
+                cursor = advanced_to + 1
 
             # Sort by (block, log_index) so summary() last-item is genuinely latest.
             self.today_transfers.sort(key=lambda t: (t.block_number, t.log_index))
             self.last_refresh_ts = now
-            self.last_error = None
+            # Partial-success semantics: clear last_error if we made progress
+            # (transfers got appended); keep error context if we made none.
+            self.last_error = chunk_err if (chunk_err and not self.today_transfers) else None
         except Exception as e:
             # Keep last-known good state; surface error so dashboard can show it
             # rather than blanking the card.
