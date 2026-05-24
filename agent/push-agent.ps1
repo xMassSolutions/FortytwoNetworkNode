@@ -177,15 +177,26 @@ function Get-NodeSnapshot {
         }
     }
 
+    # Build all_today by walking all today_lines in order — tracking the
+    # most-recent "receipt hash 0x…" line (the on-chain Monad tx that paid
+    # the round's reward). Pair it with the next "Inference round X completed"
+    # line, then reset so the next round doesn't inherit it.
     $allToday = @()
-    foreach ($line in $roundLines) {
+    $lastReceiptHash = $null
+    foreach ($line in $todayLines) {
+        if ($line -match "receipt hash (0x[0-9a-fA-F]+)") {
+            $lastReceiptHash = $matches[1]
+            continue
+        }
         if ($line -match "(\d{2}):(\d{2}):(\d{2}).*Inference round (\w+) completed.*Total time: (\d+)s") {
             $allToday += [ordered]@{
                 completed_iso = ("{0}:{1}:{2}" -f $matches[1], $matches[2], $matches[3])
                 hour          = [int]$matches[1]
                 hash          = $matches[4]
                 duration_s    = [int]$matches[5]
+                tx_hash       = $lastReceiptHash
             }
+            $lastReceiptHash = $null  # consumed
         }
     }
     # newest-first list of last 5 for backward compat / /recent command
@@ -290,7 +301,7 @@ function Get-NodeSnapshot {
     # Capsule's snapshot window, so a positive-delta count under-reports wins).
     $winsToday = $participations
 
-    $model = $null; $modelShort = $null
+    $model = $null; $modelShort = $null; $modelSizeGb = $null
     if (Test-Path $CapsuleLog) {
         $modelLine = Select-String -Path $CapsuleLog -Pattern "Using local LLM model: (.+)$" | Select-Object -Last 1
         if ($modelLine) {
@@ -304,8 +315,21 @@ function Get-NodeSnapshot {
             }
         }
     }
+    # Model file size on disk (GB). Path may be absolute or relative to ScriptsRoot.
+    if ($model) {
+        $modelPath = $null
+        if (Test-Path -LiteralPath $model)                                     { $modelPath = $model }
+        elseif (Test-Path -LiteralPath (Join-Path $ScriptsRoot $model))        { $modelPath = (Join-Path $ScriptsRoot $model) }
+        if ($modelPath) {
+            try { $modelSizeGb = [math]::Round((Get-Item -LiteralPath $modelPath).Length / 1GB, 2) } catch { }
+        }
+    }
 
     # Process detection: Docker container if -DockerContainer set, else native host processes.
+    # `Select-Object -First 1` makes `$cap` a single object instead of an array if
+    # multiple FortytwoCapsule processes happen to exist — otherwise `$cap.StartTime`
+    # is an array and the `(Get-Date) - $cap.StartTime` arithmetic silently breaks,
+    # which is what caused Uptime to be stuck at 0.
     $capPid = $null; $protoPid = $null; $capUptime = $null
     $dockerProtoAlive = $false
     if ($DockerContainer) {
@@ -315,8 +339,8 @@ function Get-NodeSnapshot {
         $capUptime        = $dockerInfo.uptimeSeconds   # container uptime (proxy for capsule uptime)
         $dockerProtoAlive = $dockerInfo.protocolAlive
     } else {
-        $cap   = Get-Process FortytwoCapsule  -ErrorAction SilentlyContinue
-        $proto = Get-Process FortytwoProtocol -ErrorAction SilentlyContinue
+        $cap   = Get-Process FortytwoCapsule  -ErrorAction SilentlyContinue | Select-Object -First 1
+        $proto = Get-Process FortytwoProtocol -ErrorAction SilentlyContinue | Select-Object -First 1
         $capPid   = if ($cap)   { $cap.Id }   else { $null }
         $protoPid = if ($proto) { $proto.Id } else { $null }
         if ($cap -and $cap.StartTime) {
@@ -358,6 +382,7 @@ function Get-NodeSnapshot {
         ts                          = (Get-Date).ToUniversalTime().ToString("o")
         model                       = $model
         model_short                 = $modelShort
+        model_size_gb               = $modelSizeGb
         capsule_max_tps             = $maxTps
         capsule_version             = $capsuleVersion
         protocol_version            = $protocolVersion
@@ -434,7 +459,7 @@ try {
 # Initial file position: skip existing content, only push on NEW events
 $lastPos = if (Test-Path $ExtLog) { (Get-Item $ExtLog).Length } else { 0 }
 
-$HeartbeatSeconds    = 30
+$HeartbeatSeconds    = 300  # 5 min — event-driven pushes still fire immediately on each inference event
 $PollIntervalSeconds = 5
 $EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
 

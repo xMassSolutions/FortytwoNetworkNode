@@ -113,6 +113,7 @@ class StatusPayload(BaseModel):
     ts: str
     model: str | None = None
     model_short: str | None = None
+    model_size_gb: float | None = None
     capsule_max_tps: int | None = None
     capsule_version: str | None = None
     protocol_version: str | None = None
@@ -232,6 +233,7 @@ async def dashboard_data():
             "received_at": s.received_at,
             "ts": s.ts,
             "model_short": s.model_short,
+            "model_size_gb": s.model_size_gb,
             "capsule_max_tps": s.capsule_max_tps,
             "capsule_version": s.capsule_version,
             "protocol_version": s.protocol_version,

@@ -8,6 +8,7 @@ class Snapshot:
     ts: str = ""
     model: str | None = None
     model_short: str | None = None
+    model_size_gb: float | None = None
     capsule_max_tps: int | None = None
     capsule_version: str | None = None
     protocol_version: str | None = None

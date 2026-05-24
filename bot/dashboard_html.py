@@ -4,12 +4,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <title>FortyTwo Network: Node Analysis</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Inline SVG favicon: stylized "42" inside an orbital ring with a satellite dot.
+     Single source — same SVG renders as the header logo (see <header> below). -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><g transform='rotate(-20 32 32)'><circle cx='32' cy='32' r='28' fill='none' stroke='%2360a5fa' stroke-width='2.5'/><circle cx='52' cy='32' r='3' fill='%234ade80'/></g><circle cx='32' cy='32' r='22' fill='%23141414'/><text x='32' y='42' text-anchor='middle' font-family='ui-monospace,monospace' font-weight='700' font-size='26' fill='%23e8e8e8'>42</text></svg>">
 <style>
 :root { --bg:#0a0a0a; --card:#141414; --text:#e8e8e8; --muted:#888; --green:#4ade80; --red:#f87171; --blue:#60a5fa; --border:#2a2a2a; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 16px; line-height: 1.5; }
 .container { max-width: 1200px; margin: 0 auto; }
 header { margin-bottom: 24px; }
+.header-row { display: flex; align-items: center; gap: 14px; }
+.logo { width: 40px; height: 40px; flex-shrink: 0; }
 h1 { font-size: 22px; font-weight: 600; }
 .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
@@ -46,8 +51,19 @@ a { color: var(--blue); text-decoration: none; }
 <body>
 <div class="container">
   <header>
-    <h1>FortyTwo Network: Node Analysis</h1>
-    <div class="meta" id="meta">Loading…</div>
+    <div class="header-row">
+      <!-- Same SVG as the favicon (head <link>) — kept inline so it scales crisply at any DPI -->
+      <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-label="FortyTwo logo">
+        <g transform="rotate(-20 32 32)">
+          <circle cx="32" cy="32" r="28" fill="none" stroke="#60a5fa" stroke-width="2.5"/>
+          <circle cx="52" cy="32" r="3" fill="#4ade80"/>
+        </g>
+        <circle cx="32" cy="32" r="22" fill="#141414"/>
+        <text x="32" y="42" text-anchor="middle" font-family="ui-monospace,monospace" font-weight="700" font-size="26" fill="#e8e8e8">42</text>
+      </svg>
+      <h1>FortyTwo Network: Node Analysis</h1>
+    </div>
+    <div class="meta" id="meta" style="margin-top:8px">Loading…</div>
   </header>
   <div class="grid">
     <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
@@ -77,16 +93,8 @@ a { color: var(--blue); text-decoration: none; }
   <div class="rounds-list">
     <div class="section-title">Recent rounds</div>
     <table>
-      <thead><tr><th>Time UTC</th><th>Duration</th><th>Request hash</th></tr></thead>
+      <thead><tr><th>Time UTC</th><th>Duration</th><th>Round hash</th><th>Tx hash</th></tr></thead>
       <tbody id="rounds-body"></tbody>
-    </table>
-  </div>
-
-  <div class="rounds-list" style="margin-top: 16px;">
-    <div class="section-title">Last 3 errors</div>
-    <table>
-      <thead><tr><th>Time UTC</th><th>Message</th></tr></thead>
-      <tbody id="errors-body"><tr><td colspan="2" style="color:var(--muted);text-align:center">Loading…</td></tr></tbody>
     </table>
   </div>
 
@@ -105,6 +113,14 @@ a { color: var(--blue); text-decoration: none; }
       </span>
     </div>
     <pre id="log-view" class="log-view"></pre>
+  </div>
+
+  <div class="rounds-list" style="margin-top: 16px;">
+    <div class="section-title">Last 3 errors</div>
+    <table>
+      <thead><tr><th>Time UTC</th><th>Message</th></tr></thead>
+      <tbody id="errors-body"><tr><td colspan="2" style="color:var(--muted);text-align:center">Loading…</td></tr></tbody>
+    </table>
   </div>
 
   <div class="rounds-list" style="margin-top: 16px;">
@@ -138,6 +154,7 @@ let logFilter = 'all';
 const LOG_EVENT_RE = /Completed inference participation|Inference round \w+ completed|FOR balance (before|after) reward|Submitting intent resolution|Resolution of .* resolved|Node's balance is|Operator Wallet Address| ERROR /;
 let tpsMode = 'actual';
 let lastSnapshot = null;
+let lastChainRewards = null;  // most recent chain_rewards payload — needed by chart-mode toggle
 
 function pad(n){ return String(n).padStart(2,'0'); }
 function fmt(v){return v==null?'—':v;}
@@ -148,63 +165,97 @@ function row(l,v){return`<div class="row"><span class="label">${l}</span><span c
 function escapeHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function hourKeyFromDate(d){return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}`;}
 
-function bucket(history, mode){
+// bucket() returns labels + two parallel data arrays: `data` (rounds count
+// from agent's rounds_history) and `forData` (FOR earned per bucket from
+// chain_rewards.transfers_by_hour). Same hour-key format means both maps share
+// the same lookup loop.
+function bucket(history, forByHour, mode){
   history = history || {};
+  forByHour = forByHour || {};
   const now = new Date();
   if (mode === 'hourly'){
     const anchorMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), now.getUTCHours());
-    const labels=[], data=[];
+    const labels=[], data=[], forData=[];
     for (let i=23; i>=0; i--){
       const t = new Date(anchorMs - i*3600e3);
+      const key = hourKeyFromDate(t);
       labels.push(pad(t.getUTCHours()));
-      data.push(history[hourKeyFromDate(t)] || 0);
+      data.push(history[key] || 0);
+      forData.push(forByHour[key] || 0);
     }
-    return {labels, data};
+    return {labels, data, forData};
   }
   if (mode === 'daily'){
     const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-    const labels=[], data=[];
+    const labels=[], data=[], forData=[];
     for (let i=6; i>=0; i--){
       const d = new Date(todayMs - i*86400e3);
       const datePrefix = `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
-      let sum = 0;
-      for (let h=0; h<24; h++){ sum += history[`${datePrefix}T${pad(h)}`] || 0; }
+      let sum = 0, forSum = 0;
+      for (let h=0; h<24; h++){
+        const k = `${datePrefix}T${pad(h)}`;
+        sum += history[k] || 0;
+        forSum += forByHour[k] || 0;
+      }
       labels.push(`${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`);
       data.push(sum);
+      forData.push(forSum);
     }
-    return {labels, data};
+    return {labels, data, forData};
   }
   if (mode === 'weekly'){
     const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
     const dow = (new Date(todayMs).getUTCDay() + 6) % 7;
     const weekStartMs = todayMs - dow*86400e3;
-    const labels=[], data=[];
+    const labels=[], data=[], forData=[];
     for (let w=3; w>=0; w--){
       const startMs = weekStartMs - w*7*86400e3;
-      let sum = 0;
+      let sum = 0, forSum = 0;
       for (let day=0; day<7; day++){
         const d = new Date(startMs + day*86400e3);
         const datePrefix = `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())}`;
-        for (let h=0; h<24; h++){ sum += history[`${datePrefix}T${pad(h)}`] || 0; }
+        for (let h=0; h<24; h++){
+          const k = `${datePrefix}T${pad(h)}`;
+          sum += history[k] || 0;
+          forSum += forByHour[k] || 0;
+        }
       }
       const startD = new Date(startMs);
       labels.push(`wk ${pad(startD.getUTCMonth()+1)}-${pad(startD.getUTCDate())}`);
       data.push(sum);
+      forData.push(forSum);
     }
-    return {labels, data};
+    return {labels, data, forData};
   }
-  return {labels:[], data:[]};
+  return {labels:[], data:[], forData:[]};
 }
 
-function updateChart(history){
-  const { labels, data } = bucket(history || {}, chartMode);
+function updateChart(history, forByHour){
+  const { labels, data, forData } = bucket(history || {}, forByHour || {}, chartMode);
   if (!chart){
     const ctx = document.getElementById('hourChart').getContext('2d');
     chart = new Chart(ctx, {
       type: 'bar',
-      data: { labels, datasets: [{ data, backgroundColor: '#60a5fa', borderColor: '#3b82f6', borderWidth: 1, borderRadius: 3 }] },
+      data: { labels, datasets: [{
+        data,
+        forPerBucket: forData,           // sidecar — read by tooltip callback below
+        backgroundColor: '#60a5fa',
+        borderColor: '#3b82f6',
+        borderWidth: 1,
+        borderRadius: 3
+      }] },
       options: { responsive: true, maintainAspectRatio: true, aspectRatio: 4,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => `${c.parsed.y} round(s)` } } },
+        plugins: { legend: { display: false }, tooltip: { callbacks: {
+          label: c => {
+            const rounds = c.parsed.y;
+            const ds = c.chart.data.datasets[0];
+            const forV = (ds.forPerBucket && ds.forPerBucket[c.dataIndex]) || 0;
+            const forStr = forV > 0
+              ? `${forV.toLocaleString(undefined, {maximumFractionDigits: 2})} FOR`
+              : '— FOR';
+            return [`${rounds} round${rounds === 1 ? '' : 's'}`, forStr];
+          }
+        } } },
         scales: {
           x: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', font: { size: 10 } } },
           y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#888', precision: 0 } }
@@ -214,6 +265,7 @@ function updateChart(history){
   } else {
     chart.data.labels = labels;
     chart.data.datasets[0].data = data;
+    chart.data.datasets[0].forPerBucket = forData;
     chart.update('none');
   }
 }
@@ -228,6 +280,9 @@ function updateLog(s){
   pre.textContent = lines.length
     ? lines.join('\n')
     : (logFilter === 'events' ? '(no matching events in this window)' : '(no log lines received)');
+  // Auto-scroll to the newest line so users see the current entry on load /
+  // every refresh, instead of having to scroll down through 500 lines of history.
+  pre.scrollTop = pre.scrollHeight;
 }
 
 function updateErrors(s){
@@ -263,8 +318,12 @@ function renderNodeCard(s){
     ? `${(s.gpu_vram_used_mb/1024).toFixed(1)} GB / ${(s.gpu_vram_total_mb/1024).toFixed(1)} GB`
     : '—';
 
+  // Model row: name + file size (GB) when the agent could stat the file.
+  const sizeFrag = (s.model_size_gb && s.model_size_gb > 0)
+    ? ` <span style="color:var(--muted)">(${Number(s.model_size_gb).toFixed(1)} GB)</span>`
+    : '';
   el.innerHTML =
-      row('Model', `<span style="font-size:11px">${s.model_short||'—'}</span>`)
+      row('Model', `<span style="font-size:11px">${s.model_short||'—'}${sizeFrag}</span>`)
     + row('GPU', `<span style="font-size:12px">${escapeHtml(gpuName)}</span>`)
     + row('VRAM', vram)
     + renderTpsRows(s)
@@ -280,10 +339,17 @@ async function refresh(){
 
   const s = data.snapshot;
   lastSnapshot = s;
+  lastChainRewards = data.chain_rewards || null;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
 
+  // Staleness threshold: heartbeat is 5 min (300s); flag anything older than
+  // 6 min as STALE to leave room for jitter / agent scheduling delays.
+  const ageS = s ? (Date.now()/1000 - s.received_at) : null;
+  const staleBadge = (ageS != null && ageS > 360)
+    ? ` <span class="badge down" title="No agent push received in ${Math.round(ageS/60)} min">STALE</span>`
+    : '';
   document.getElementById('meta').innerHTML = s
-    ? `Wallet <span style="font-family:monospace">${data.wallet_short}</span> · last push ${fmtAgo(s.received_at)} (UTC ${s.ts?s.ts.slice(11,19):'—'})`
+    ? `Wallet <span style="font-family:monospace">${data.wallet_short}</span> · last push ${fmtAgo(s.received_at)} (UTC ${s.ts?s.ts.slice(11,19):'—'})${staleBadge}`
     : '<span class="badge down">No data</span> — workstation agent has not pushed yet';
 
   if(!s){
@@ -314,8 +380,23 @@ async function refresh(){
 
     const recent = s.recent_rounds || [];
     document.getElementById('rounds-body').innerHTML = recent.length
-      ? recent.map(r=>`<tr><td>${r.completed_iso}</td><td>${r.duration_s}s</td><td style="color:var(--muted)">${(r.hash||'').slice(0,16)}…</td></tr>`).join('')
-      : '<tr><td colspan="3" style="color:var(--muted);text-align:center">No rounds today</td></tr>';
+      ? recent.map(r => {
+          const roundHash = (r.hash || '').slice(0, 16);
+          const txHash = r.tx_hash;
+          // Tx hash is the on-chain Monad receipt that paid the round's reward
+          // (from "Resolution of ... resolved. receipt hash 0x…" in the log).
+          // Link goes to monadscan testnet so the user can verify on-chain.
+          const txCell = txHash
+            ? `<a href="https://testnet.monadscan.com/tx/${txHash}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none" title="${txHash}">${txHash.slice(0,12)}…</a>`
+            : '<span style="color:var(--muted)">—</span>';
+          return `<tr>`
+            + `<td>${r.completed_iso}</td>`
+            + `<td>${r.duration_s}s</td>`
+            + `<td style="color:var(--muted)">${roundHash}…</td>`
+            + `<td>${txCell}</td>`
+            + `</tr>`;
+        }).join('')
+      : '<tr><td colspan="4" style="color:var(--muted);text-align:center">No rounds today</td></tr>';
   }
 
   if(data.balance!=null){
@@ -348,7 +429,7 @@ async function refresh(){
     document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${data.balance_error||'unknown'}</div>`;
   }
 
-  updateChart(s ? s.rounds_history : {});
+  updateChart(s ? s.rounds_history : {}, lastChainRewards ? lastChainRewards.transfers_by_hour : {});
   updateErrors(s);
   updateLog(s);
 }
@@ -412,7 +493,7 @@ document.querySelectorAll('.toggle-btn[data-mode]').forEach(btn => {
   btn.addEventListener('click', () => {
     chartMode = btn.dataset.mode;
     document.querySelectorAll('.toggle-btn[data-mode]').forEach(b => b.classList.toggle('active', b.dataset.mode === chartMode));
-    updateChart(lastSnapshot ? lastSnapshot.rounds_history : {});
+    updateChart(lastSnapshot ? lastSnapshot.rounds_history : {}, lastChainRewards ? lastChainRewards.transfers_by_hour : {});
   });
 });
 

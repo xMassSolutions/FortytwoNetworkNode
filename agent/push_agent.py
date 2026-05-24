@@ -218,6 +218,7 @@ CAPSULE_VERSION_RE = re.compile(r"Fortytwo Capsule current version: (\S+)")
 PROTOCOL_VERSION_RE = re.compile(
     r"(?:Protocol version|protocol.+version)[:\s]+v?(\d+\.\d+\.\d+)"
 )
+RECEIPT_HASH_RE = re.compile(r"receipt hash (0x[0-9a-fA-F]+)")
 
 EVENT_PATTERN_RE = re.compile(
     r"Completed inference participation|Inference round \w+ completed.*Total time"
@@ -375,8 +376,17 @@ def get_node_snapshot(
             last_round = m_last.group(1)
             last_duration = int(m_last.group(2))
 
+    # Build all_today by walking all today_lines in order — tracking the
+    # most-recent "receipt hash 0x…" line (the on-chain Monad tx that paid
+    # the round's reward). Pair it with the next "Inference round X completed"
+    # line, then reset so the next round doesn't inherit it.
     all_today: list[dict[str, Any]] = []
-    for ln in round_lines:
+    last_receipt_hash: str | None = None
+    for ln in today_lines:
+        m_r = RECEIPT_HASH_RE.search(ln)
+        if m_r:
+            last_receipt_hash = m_r.group(1)
+            continue
         m = ROUND_DETAIL_RE.search(ln)
         if m:
             all_today.append(
@@ -385,8 +395,10 @@ def get_node_snapshot(
                     "hour": int(m.group(1)),
                     "hash": m.group(4),
                     "duration_s": int(m.group(5)),
+                    "tx_hash": last_receipt_hash,
                 }
             )
+            last_receipt_hash = None  # consumed
 
     # Newest-first last 5 for /recent command parity (kept at 5)
     recent = list(reversed(all_today[-5:])) if all_today else []
@@ -495,6 +507,7 @@ def get_node_snapshot(
     # Model
     model: str | None = None
     model_short: str | None = None
+    model_size_gb: float | None = None
     capsule_content = read_text(capsule_log)
     last_model_match = None
     for m in MODEL_LOCAL_RE.finditer(capsule_content):
@@ -509,6 +522,16 @@ def get_node_snapshot(
         if last_hf:
             model_short = last_hf.group(1)
             model = model_short
+
+    # Model file size on disk (GB). Path may be absolute or relative to scripts_root.
+    if model:
+        for cand in (Path(model), scripts_root / model):
+            try:
+                if cand.exists() and cand.is_file():
+                    model_size_gb = round(cand.stat().st_size / (1024 ** 3), 2)
+                    break
+            except Exception:
+                continue
 
     # Process detection: Docker container if configured, else native host processes.
     if docker_container:
@@ -554,6 +577,7 @@ def get_node_snapshot(
         "ts": utc_now_iso(),
         "model": model,
         "model_short": model_short,
+        "model_size_gb": model_size_gb,
         "capsule_max_tps": max_tps,
         "capsule_version": capsule_version,
         "protocol_version": protocol_version,
@@ -624,7 +648,9 @@ def post_snapshot(bot_url: str, agent_token: str, snap: dict[str, Any]) -> None:
 
 def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path) -> None:
     ext_log = scripts_root / "extended_log.txt"
-    heartbeat_seconds = 30
+    # 5 min heartbeat — event-driven pushes still fire on each inference event,
+    # so this is just the fallback floor when the node is idle.
+    heartbeat_seconds = 300
     poll_interval = 5
 
     print(

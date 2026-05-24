@@ -247,9 +247,19 @@ class RewardsTracker:
         earned = sum(t.amount for t in self.today_transfers)
         count = len(self.today_transfers)
         last = self.today_transfers[-1] if self.today_transfers else None
+        # Bucket today's transfers by UTC hour. Keys match the agent's
+        # rounds_history format ("YYYY-MM-DDTHH") so the dashboard's bucket()
+        # helper can reuse the same lookup pattern for tooltips.
+        by_hour: dict[str, float] = {}
+        for t in self.today_transfers:
+            dt = datetime.fromtimestamp(t.ts, tz=timezone.utc)
+            key = dt.strftime("%Y-%m-%dT%H")
+            by_hour[key] = by_hour.get(key, 0.0) + t.amount
+        by_hour_rounded = {k: round(v, 6) for k, v in by_hour.items()}
         return {
             "earned_today": round(earned, 6) if earned else 0.0,
             "transfers_today": count,
+            "transfers_by_hour": by_hour_rounded,
             "last_transfer_amount": round(last.amount, 6) if last else None,
             "last_transfer_iso": last.iso if last else None,
             "last_transfer_tx": last.tx_hash if last else None,
