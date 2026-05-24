@@ -62,7 +62,24 @@ function Invoke-AutoUpdateCheck {
         Write-Output "[$now] auto-update: remote $remoteShort differs from local, pulling..."
         $pullOut = & git -C $RepoRoot pull --ff-only 2>&1
         if ($LASTEXITCODE -eq 0) {
-            Write-Output "[$now] auto-update: pulled, exiting to restart with new code"
+            Write-Output "[$now] auto-update: pulled, killing any stray push-agent processes then exiting to restart with new code"
+            # Defensive sibling-process cleanup: if a previous restart left
+            # a stale copy of push-agent.ps1 running (rare but seen during
+            # earlier debugging), it'd keep posting old-code snapshots over
+            # the fresh respawn's. Kill any sibling powershell.exe whose
+            # command line references this script before exiting ourselves.
+            try {
+                $myPid = $PID
+                $strays = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+                          Where-Object {
+                              $_.ProcessId -ne $myPid -and
+                              ($_.CommandLine -like '*push-agent.ps1*' -or $_.CommandLine -like '*_agent-wrapper*')
+                          }
+                foreach ($p in $strays) {
+                    Write-Output ("[{0}] auto-update: killing stray PID {1}" -f $now, $p.ProcessId)
+                    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+            } catch { }
             exit 0   # Scheduled Task "restart on failure" respawns with new code
         } else {
             Write-Output ("[{0}] auto-update: git pull --ff-only failed (probably local divergence) -- staying on current code. Output: {1}" -f $now, ($pullOut -join ' '))

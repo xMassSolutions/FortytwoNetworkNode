@@ -191,17 +191,19 @@ local workstation agent.
 
 ### Update (pull latest + restart)
 
-The most common ask: a new agent change has landed on `main` and you want to
-pick it up. The bot auto-deploys via Render, but the agent on your workstation
-runs from the cloned repo and has to be pulled manually.
+The auto-updater (next section) handles this every 30 min on its own. Use this
+command when you want a fix immediately:
 
 **Windows** (admin PowerShell):
 
 ```powershell
 cd $env:USERPROFILE\FortytwoBot
-git pull
-Restart-ScheduledTask -TaskName FortytwoBotAgent
+.\agent\update-agent.ps1
 ```
+
+The helper script does `git pull`, cleanly ends the scheduled task, kills any
+stray `push-agent.ps1` processes, restarts the task, and tails the agent log
+so you can confirm the bootstrap push.
 
 **macOS:**
 
@@ -216,8 +218,12 @@ launchctl kickstart -k gui/$(id -u)/com.fortytwo.agent
 **Windows:**
 
 ```powershell
-Restart-ScheduledTask -TaskName FortytwoBotAgent
+Stop-ScheduledTask  -TaskName FortytwoBotAgent
+Start-ScheduledTask -TaskName FortytwoBotAgent
 ```
+
+(Or run `.\agent\update-agent.ps1` for the full pull+restart with stray
+cleanup — it works even when there's nothing to pull.)
 
 **macOS:**
 
