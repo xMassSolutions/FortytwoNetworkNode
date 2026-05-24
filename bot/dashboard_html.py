@@ -329,11 +329,12 @@ async function refresh(){
   lastChainRewards = data.chain_rewards || null;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
 
-  // Staleness threshold: heartbeat is 5 min (300s); flag anything older than
-  // 6 min as STALE to leave room for jitter / agent scheduling delays.
+  // Staleness threshold: heartbeat is 60s; flag anything older than 3 min
+  // (3 missed heartbeats) as STALE to leave room for jitter / network blips
+  // without false-positive flapping.
   const ageS = s ? (Date.now()/1000 - s.received_at) : null;
-  const staleBadge = (ageS != null && ageS > 360)
-    ? ` <span class="badge down" title="No agent push received in ${Math.round(ageS/60)} min">STALE</span>`
+  const staleBadge = (ageS != null && ageS > 180)
+    ? ` <span class="badge down" title="No agent push received in ${Math.round(ageS)}s">STALE</span>`
     : '';
   // Agent version (short git SHA) — operator can see which commit the agent
   // is running. Useful for confirming an auto-update landed.

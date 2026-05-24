@@ -727,9 +727,10 @@ def post_snapshot(bot_url: str, agent_token: str, snap: dict[str, Any]) -> None:
 
 def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path) -> None:
     ext_log = scripts_root / "extended_log.txt"
-    # 5 min heartbeat — event-driven pushes still fire on each inference event,
-    # so this is just the fallback floor when the node is idle.
-    heartbeat_seconds = 300
+    # 1 min heartbeat floor. Inference-event pushes still fire immediately
+    # on each round completion / participation, so this only matters when
+    # the node is idle between events.
+    heartbeat_seconds = 60
     poll_interval = 5
 
     # Auto-update cadence (minutes between git ls-remote checks). 0 disables.

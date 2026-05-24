@@ -243,6 +243,93 @@ class RewardsTracker:
             # rather than blanking the card.
             self.last_error = f"{type(e).__name__}: {e}"
 
+    def attach_tx_hashes(
+        self,
+        rounds: list[dict[str, Any]],
+        today_date: str | None,
+        window_seconds: int = 60,
+    ) -> list[dict[str, Any]]:
+        """Inject `tx_hash` into round dicts whose tx_hash is null/missing,
+        sourcing from `self.today_transfers` by nearest-time match.
+
+        Why: recent Capsule versions stopped logging `Resolution of ...
+        receipt hash 0x...` so the agent's parser can't pair tx hashes.
+        Chain-side matching is format-independent and uses the authoritative
+        Monad receipt.
+
+        Algorithm:
+        - Sort transfers + rounds by time.
+        - Greedy assignment in chronological order: each round claims the
+          nearest unused transfer within ±window_seconds.
+        - Returns a NEW list (doesn't mutate input).
+        - Rounds with a non-null tx_hash already populated by the agent are
+          left untouched.
+
+        Pre-conditions: `today_date` is a "YYYY-MM-DD" string used to convert
+        each round's `completed_iso` (HH:MM:SS) to a UTC epoch.
+        """
+        if not rounds or not self.today_transfers or not today_date:
+            return rounds
+        try:
+            midnight = datetime.fromisoformat(today_date).replace(tzinfo=timezone.utc)
+            midnight_ts = int(midnight.timestamp())
+        except Exception:
+            return rounds
+
+        avail: list[tuple[int, str]] = sorted(
+            [(t.ts, t.tx_hash) for t in self.today_transfers],
+            key=lambda x: x[0],
+        )
+        used: set[int] = set()
+
+        def _round_ts(r: dict[str, Any]) -> int | None:
+            iso = r.get("completed_iso")
+            if not iso:
+                return None
+            try:
+                h, m, s = (int(x) for x in str(iso).split(":"))
+                return midnight_ts + h * 3600 + m * 60 + s
+            except Exception:
+                return None
+
+        # Match greedily in chronological order so adjacent rounds claim
+        # adjacent transfers, even though `rounds` may be newest-first.
+        order = sorted(
+            range(len(rounds)),
+            key=lambda i: (_round_ts(rounds[i]) is None, _round_ts(rounds[i]) or 0),
+        )
+        matches: dict[int, str] = {}
+        for orig_i in order:
+            r = rounds[orig_i]
+            if r.get("tx_hash"):
+                continue
+            rts = _round_ts(r)
+            if rts is None:
+                continue
+            best_ai = None
+            best_delta = window_seconds + 1
+            for ai, (ts, _tx) in enumerate(avail):
+                if ai in used:
+                    continue
+                d = abs(ts - rts)
+                if d < best_delta:
+                    best_delta = d
+                    best_ai = ai
+            if best_ai is not None and best_delta <= window_seconds:
+                used.add(best_ai)
+                matches[orig_i] = avail[best_ai][1]
+
+        # Rebuild in original order with matched tx_hashes injected.
+        out: list[dict[str, Any]] = []
+        for i, r in enumerate(rounds):
+            if i in matches:
+                r2 = dict(r)
+                r2["tx_hash"] = matches[i]
+                out.append(r2)
+            else:
+                out.append(r)
+        return out
+
     def summary(self) -> dict[str, Any]:
         earned = sum(t.amount for t in self.today_transfers)
         count = len(self.today_transfers)

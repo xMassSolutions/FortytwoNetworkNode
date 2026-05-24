@@ -535,7 +535,7 @@ if ($Once) {
     return
 }
 
-$HeartbeatSeconds    = 300  # 5 min -- event-driven pushes still fire immediately on each inference event
+$HeartbeatSeconds    = 60   # 1 min floor. Inference-event pushes still fire immediately on round completion / participation.
 $PollIntervalSeconds = 5
 $EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
 

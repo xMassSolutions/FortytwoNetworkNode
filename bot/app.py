@@ -261,8 +261,19 @@ async def dashboard_data():
             "protocol_pid": s.protocol_pid,
             "capsule_alive": s.capsule_alive,
             "protocol_alive": s.protocol_alive,
-            "recent_rounds": s.recent_rounds,
-            "all_rounds_today": s.all_rounds_today,
+            # Chain-side tx_hash backfill: recent Capsule versions stopped
+            # logging "Resolution of ... receipt hash 0x..." entirely, so the
+            # agent can't pair tx hashes from logs. The tracker matches each
+            # round to the nearest on-chain Transfer by timestamp (±60s) and
+            # injects the tx_hash. Rounds with a tx_hash already populated by
+            # the agent are left untouched. Falls back to passing through
+            # untouched if today_transfers is empty.
+            "recent_rounds": rewards_tracker.attach_tx_hashes(
+                s.recent_rounds, (s.ts or "")[:10]
+            ),
+            "all_rounds_today": rewards_tracker.attach_tx_hashes(
+                s.all_rounds_today, (s.ts or "")[:10]
+            ),
             "rounds_history": s.rounds_history,
             "recent_errors": s.recent_errors,
             "log_extended": s.log_extended,
