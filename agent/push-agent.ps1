@@ -44,7 +44,7 @@ function Get-AgentVersion {
 
 function Invoke-AutoUpdateCheck {
     # Compare local HEAD to origin/main; if different, ff-only pull and exit so the
-    # scheduled task respawns us on the new code. Failures are logged and ignored —
+    # scheduled task respawns us on the new code. Failures are logged and ignored --
     # an RPC blip or local divergence must never crash the monitor.
     if ($AutoUpdateMinutes -le 0) { return }
     $now = Get-Date -Format "HH:mm:ss"
@@ -59,13 +59,13 @@ function Invoke-AutoUpdateCheck {
         if (-not $remoteSha -or -not $localSha) { return }
         if ($remoteSha -eq $localSha) { return }
         $remoteShort = $remoteSha.Substring(0, 7)
-        Write-Output "[$now] auto-update: remote $remoteShort differs from local, pulling…"
+        Write-Output "[$now] auto-update: remote $remoteShort differs from local, pulling..."
         $pullOut = & git -C $RepoRoot pull --ff-only 2>&1
         if ($LASTEXITCODE -eq 0) {
             Write-Output "[$now] auto-update: pulled, exiting to restart with new code"
             exit 0   # Scheduled Task "restart on failure" respawns with new code
         } else {
-            Write-Output ("[{0}] auto-update: git pull --ff-only failed (probably local divergence) — staying on current code. Output: {1}" -f $now, ($pullOut -join ' '))
+            Write-Output ("[{0}] auto-update: git pull --ff-only failed (probably local divergence) -- staying on current code. Output: {1}" -f $now, ($pullOut -join ' '))
         }
     } catch {
         Write-Output ("[{0}] auto-update: exception {1} (skipping this cycle)" -f $now, $_.Exception.Message)
@@ -213,7 +213,7 @@ function Get-NodeSnapshot {
     $participations = @($todayLines | Where-Object { $_ -match "Completed inference participation" }).Count
     $roundLines     = @($todayLines | Where-Object { $_ -match "Inference round.*Total time" })
     $observed       = $roundLines.Count
-    # Exclude transport-layer noise (Kademlia bootstrap timeouts, peer Identify timeouts) — counts only inference-relevant errors
+    # Exclude transport-layer noise (Kademlia bootstrap timeouts, peer Identify timeouts) -- counts only inference-relevant errors
     $errorLines = @($todayLines | Where-Object {
         $_ -match " ERROR " -and
         $_ -notmatch "Kademlia bootstrap is timeout" -and
@@ -230,8 +230,8 @@ function Get-NodeSnapshot {
         }
     }
 
-    # Build all_today by walking all today_lines in order — tracking the
-    # most-recent "receipt hash 0x…" line (the on-chain Monad tx that paid
+    # Build all_today by walking all today_lines in order -- tracking the
+    # most-recent "receipt hash 0x..." line (the on-chain Monad tx that paid
     # the round's reward). Pair it with the next "Inference round X completed"
     # line, then reset so the next round doesn't inherit it.
     $allToday = @()
@@ -289,7 +289,7 @@ function Get-NodeSnapshot {
         }
     }
 
-    # Reward parser — full-file scan + windowed pairing.
+    # Reward parser -- full-file scan + windowed pairing.
     # Why: the old `$todayLines` filter dropped any balance line that didn't
     # start with `UTC YYYY-MM-DD`, and the strict consecutive-pair loop
     # desynced permanently the moment ONE line was lost. Both undercounted
@@ -305,7 +305,7 @@ function Get-NodeSnapshot {
     $rewardsTodayTotal = $null
     # rewardsLoggedToday = positive-delta pairs (rewards captured inside the
     # Capsule's ~7-second balance-before/after snapshot window). This is a
-    # subset of participations — the rest of the rewards land on-chain
+    # subset of participations -- the rest of the rewards land on-chain
     # outside the snapshot window and are visible via chain_rewards on the bot.
     $rewardsLoggedToday = 0
     if (Test-Path $ExtLog) {
@@ -334,11 +334,11 @@ function Get-NodeSnapshot {
             }
             if ($null -eq $beforeVal) { continue }
             if ($afterVal -le $beforeVal) { continue }
-            # Only trust deltas with a parseable date — otherwise the line may
+            # Only trust deltas with a parseable date -- otherwise the line may
             # be a stray fragment and would pollute lastReward.
             if (-not $parsed[$i].date) { continue }
             $delta = $afterVal - $beforeVal
-            # Last reward — most recent dated positive delta (across all dates).
+            # Last reward -- most recent dated positive delta (across all dates).
             $lastReward = [math]::Round($delta, 6)
             $lastRewardTime = $parsed[$i].time
             # Today's totals
@@ -349,7 +349,7 @@ function Get-NodeSnapshot {
         }
         if ($totalSum -gt 0) { $rewardsTodayTotal = [math]::Round($totalSum, 6) }
     }
-    # wins_today now mirrors participations — every round the node participated
+    # wins_today now mirrors participations -- every round the node participated
     # in counts as a win (rewards land on-chain async, often outside the
     # Capsule's snapshot window, so a positive-delta count under-reports wins).
     $winsToday = $participations
@@ -380,7 +380,7 @@ function Get-NodeSnapshot {
 
     # Process detection: Docker container if -DockerContainer set, else native host processes.
     # `Select-Object -First 1` makes `$cap` a single object instead of an array if
-    # multiple FortytwoCapsule processes happen to exist — otherwise `$cap.StartTime`
+    # multiple FortytwoCapsule processes happen to exist -- otherwise `$cap.StartTime`
     # is an array and the `(Get-Date) - $cap.StartTime` arithmetic silently breaks,
     # which is what caused Uptime to be stuck at 0.
     $capPid = $null; $protoPid = $null; $capUptime = $null
@@ -499,7 +499,7 @@ if ($Once) {
     return
 }
 
-$HeartbeatSeconds    = 300  # 5 min — event-driven pushes still fire immediately on each inference event
+$HeartbeatSeconds    = 300  # 5 min -- event-driven pushes still fire immediately on each inference event
 $PollIntervalSeconds = 5
 $EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
 
@@ -517,7 +517,7 @@ try {
 
 # Initial file position: skip existing content, only push on NEW events
 $lastPos = if (Test-Path $ExtLog) { (Get-Item $ExtLog).Length } else { 0 }
-$lastUpdateCheck = Get-Date  # don't auto-update on the first cycle — wait one interval
+$lastUpdateCheck = Get-Date  # don't auto-update on the first cycle -- wait one interval
 
 while ($true) {
     Start-Sleep -Seconds $PollIntervalSeconds
