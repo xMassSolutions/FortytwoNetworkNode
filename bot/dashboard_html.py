@@ -13,8 +13,6 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 16px; line-height: 1.5; }
 .container { max-width: 1200px; margin: 0 auto; }
 header { margin-bottom: 24px; }
-.header-row { display: flex; align-items: center; gap: 14px; }
-.logo { width: 40px; height: 40px; flex-shrink: 0; }
 h1 { font-size: 22px; font-weight: 600; }
 .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
@@ -51,19 +49,8 @@ a { color: var(--blue); text-decoration: none; }
 <body>
 <div class="container">
   <header>
-    <div class="header-row">
-      <!-- Same SVG as the favicon (head <link>) — kept inline so it scales crisply at any DPI -->
-      <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-label="FortyTwo logo">
-        <g transform="rotate(-20 32 32)">
-          <circle cx="32" cy="32" r="28" fill="none" stroke="#60a5fa" stroke-width="2.5"/>
-          <circle cx="52" cy="32" r="3" fill="#4ade80"/>
-        </g>
-        <circle cx="32" cy="32" r="22" fill="#141414"/>
-        <text x="32" y="42" text-anchor="middle" font-family="ui-monospace,monospace" font-weight="700" font-size="26" fill="#e8e8e8">42</text>
-      </svg>
-      <h1>FortyTwo Network: Node Analysis</h1>
-    </div>
-    <div class="meta" id="meta" style="margin-top:8px">Loading…</div>
+    <h1>FortyTwo Network: Node Analysis</h1>
+    <div class="meta" id="meta">Loading…</div>
   </header>
   <div class="grid">
     <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
@@ -348,8 +335,13 @@ async function refresh(){
   const staleBadge = (ageS != null && ageS > 360)
     ? ` <span class="badge down" title="No agent push received in ${Math.round(ageS/60)} min">STALE</span>`
     : '';
+  // Agent version (short git SHA) — operator can see which commit the agent
+  // is running. Useful for confirming an auto-update landed.
+  const versionFrag = (s && s.agent_version)
+    ? ` · <span style="font-family:monospace;font-size:11px">v ${escapeHtml(s.agent_version)}</span>`
+    : '';
   document.getElementById('meta').innerHTML = s
-    ? `Wallet <span style="font-family:monospace">${data.wallet_short}</span> · last push ${fmtAgo(s.received_at)} (UTC ${s.ts?s.ts.slice(11,19):'—'})${staleBadge}`
+    ? `Wallet <span style="font-family:monospace">${data.wallet_short}</span> · last push ${fmtAgo(s.received_at)} (UTC ${s.ts?s.ts.slice(11,19):'—'})${versionFrag}${staleBadge}`
     : '<span class="badge down">No data</span> — workstation agent has not pushed yet';
 
   if(!s){

@@ -6,7 +6,8 @@ param(
     [string]$ScriptsRoot,
     [string]$DockerContainer = $env:FORTYTWO_DOCKER_CONTAINER,
     [switch]$Once,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$NoAutoUpdate   # disable git ls-remote/pull cycle entirely
 )
 
 if (-not $DryRun) {
@@ -18,6 +19,58 @@ $ExtLog          = Join-Path $ScriptsRoot "extended_log.txt"
 $CapsuleLog      = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.log"
 $ReadyUrl        = "http://localhost:42442/ready"
 $RoundsHistoryFile = Join-Path $PSScriptRoot "rounds-history.json"
+# Repo root: this script lives in <repo>/agent/, so parent of $PSScriptRoot is the repo.
+# Used by the auto-update cycle to run git from the correct working dir.
+$RepoRoot = Split-Path $PSScriptRoot -Parent
+
+# Auto-update cadence: minutes between `git ls-remote` checks. 0 disables.
+# Resolution order: explicit -NoAutoUpdate switch wins, then env override, then default.
+$AutoUpdateMinutes = if ($NoAutoUpdate) {
+    0
+} elseif ($env:FORTYTWO_AUTOUPDATE_MINUTES) {
+    try { [int]$env:FORTYTWO_AUTOUPDATE_MINUTES } catch { 30 }
+} else {
+    30
+}
+
+function Get-AgentVersion {
+    # Short SHA of the current HEAD. Returns $null if git fails or this isn't a checkout.
+    try {
+        $sha = & git -C $RepoRoot rev-parse --short HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $sha) { return $sha.Trim() }
+    } catch { }
+    return $null
+}
+
+function Invoke-AutoUpdateCheck {
+    # Compare local HEAD to origin/main; if different, ff-only pull and exit so the
+    # scheduled task respawns us on the new code. Failures are logged and ignored —
+    # an RPC blip or local divergence must never crash the monitor.
+    if ($AutoUpdateMinutes -le 0) { return }
+    $now = Get-Date -Format "HH:mm:ss"
+    try {
+        $remoteOut = & git -C $RepoRoot ls-remote origin main 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $remoteOut) {
+            Write-Output "[$now] auto-update: ls-remote failed (skipping this cycle)"
+            return
+        }
+        $remoteSha = ($remoteOut -split "\s+")[0]
+        $localSha  = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim()
+        if (-not $remoteSha -or -not $localSha) { return }
+        if ($remoteSha -eq $localSha) { return }
+        $remoteShort = $remoteSha.Substring(0, 7)
+        Write-Output "[$now] auto-update: remote $remoteShort differs from local, pulling…"
+        $pullOut = & git -C $RepoRoot pull --ff-only 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Output "[$now] auto-update: pulled, exiting to restart with new code"
+            exit 0   # Scheduled Task "restart on failure" respawns with new code
+        } else {
+            Write-Output ("[{0}] auto-update: git pull --ff-only failed (probably local divergence) — staying on current code. Output: {1}" -f $now, ($pullOut -join ' '))
+        }
+    } catch {
+        Write-Output ("[{0}] auto-update: exception {1} (skipping this cycle)" -f $now, $_.Exception.Message)
+    }
+}
 
 function Read-RoundsHistory($path) {
     if (-not (Test-Path $path)) { return @{} }
@@ -380,6 +433,7 @@ function Get-NodeSnapshot {
 
     return [ordered]@{
         ts                          = (Get-Date).ToUniversalTime().ToString("o")
+        agent_version               = (Get-AgentVersion)
         model                       = $model
         model_short                 = $modelShort
         model_size_gb               = $modelSizeGb
@@ -445,7 +499,12 @@ if ($Once) {
     return
 }
 
-Write-Output "Fortytwo agent starting. Mode: event-driven + ${HeartbeatSeconds}s heartbeat. Bot URL: $BotUrl"
+$HeartbeatSeconds    = 300  # 5 min — event-driven pushes still fire immediately on each inference event
+$PollIntervalSeconds = 5
+$EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
+
+$autoUpdateBanner = if ($AutoUpdateMinutes -gt 0) { "auto-update every ${AutoUpdateMinutes}m" } else { "auto-update disabled" }
+Write-Output "Fortytwo agent starting. Mode: event-driven + ${HeartbeatSeconds}s heartbeat, $autoUpdateBanner. Bot URL: $BotUrl"
 
 # Bootstrap push so the bot has fresh data immediately on agent start
 $lastPushTime = [DateTime]::MinValue
@@ -458,13 +517,18 @@ try {
 
 # Initial file position: skip existing content, only push on NEW events
 $lastPos = if (Test-Path $ExtLog) { (Get-Item $ExtLog).Length } else { 0 }
-
-$HeartbeatSeconds    = 300  # 5 min — event-driven pushes still fire immediately on each inference event
-$PollIntervalSeconds = 5
-$EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
+$lastUpdateCheck = Get-Date  # don't auto-update on the first cycle — wait one interval
 
 while ($true) {
     Start-Sleep -Seconds $PollIntervalSeconds
+
+    # Auto-update check (every AutoUpdateMinutes). Runs git ls-remote / pull,
+    # and exit 0 on a successful pull so the scheduled task respawns us on
+    # the new code. Cheap (1 RPC per interval) and never crashes the agent.
+    if ($AutoUpdateMinutes -gt 0 -and ((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $AutoUpdateMinutes) {
+        Invoke-AutoUpdateCheck
+        $lastUpdateCheck = Get-Date
+    }
 
     # Heartbeat (so bot snapshots survive its redeploys / silent periods)
     if (((Get-Date) - $lastPushTime).TotalSeconds -ge $HeartbeatSeconds) {

@@ -41,6 +41,61 @@ from typing import Any
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LINE_TRUNCATE = 500
 
+# Repo root for auto-update: this script lives in <repo>/agent/, parent is the repo.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def get_agent_version() -> str | None:
+    """Short SHA of HEAD. Returns None if git fails or this isn't a checkout."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def auto_update_check(stamp: str) -> None:
+    """Compare local HEAD to origin/main; if different, ff-only pull + exit 0
+    so launchd / scheduled task respawns us on the new code. Failures are
+    logged and ignored — never crashes the agent.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-remote", "origin", "main"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0 or not r.stdout.strip():
+            print(f"[{stamp}] auto-update: ls-remote failed (skipping this cycle)", flush=True)
+            return
+        remote_sha = r.stdout.split()[0]
+        r2 = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        local_sha = r2.stdout.strip() if r2.returncode == 0 else ""
+        if not remote_sha or not local_sha or remote_sha == local_sha:
+            return
+        print(f"[{stamp}] auto-update: remote {remote_sha[:7]} differs from local, pulling…", flush=True)
+        pull = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if pull.returncode == 0:
+            print(f"[{stamp}] auto-update: pulled, exiting to restart with new code", flush=True)
+            sys.exit(0)   # launchd KeepAlive / scheduled-task restart respawns with new code
+        else:
+            out = (pull.stdout + " " + pull.stderr).strip()
+            print(f"[{stamp}] auto-update: git pull --ff-only failed (probably local divergence) — staying on current code. Output: {out}", flush=True)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[{stamp}] auto-update: exception {type(e).__name__}: {e} (skipping this cycle)", flush=True)
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -575,6 +630,7 @@ def get_node_snapshot(
 
     return {
         "ts": utc_now_iso(),
+        "agent_version": get_agent_version(),
         "model": model,
         "model_short": model_short,
         "model_size_gb": model_size_gb,
@@ -653,9 +709,23 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
     heartbeat_seconds = 300
     poll_interval = 5
 
+    # Auto-update cadence (minutes between git ls-remote checks). 0 disables.
+    # Explicit --no-auto-update wins; otherwise FORTYTWO_AUTOUPDATE_MINUTES env;
+    # otherwise default 30.
+    if args.no_auto_update:
+        auto_update_minutes = 0
+    else:
+        try:
+            auto_update_minutes = int(os.environ.get("FORTYTWO_AUTOUPDATE_MINUTES", "30"))
+        except ValueError:
+            auto_update_minutes = 30
+    auto_update_banner = (
+        f"auto-update every {auto_update_minutes}m" if auto_update_minutes > 0 else "auto-update disabled"
+    )
+
     print(
-        f"Fortytwo agent starting. Mode: event-driven + {heartbeat_seconds}s heartbeat. "
-        f"Bot URL: {args.bot_url}",
+        f"Fortytwo agent starting. Mode: event-driven + {heartbeat_seconds}s heartbeat, "
+        f"{auto_update_banner}. Bot URL: {args.bot_url}",
         flush=True,
     )
 
@@ -668,11 +738,19 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
         print(f"[bootstrap] {e}", flush=True)
 
     last_pos = ext_log.stat().st_size if ext_log.exists() else 0
+    last_update_check = time.time()  # don't auto-update on the first cycle — wait one interval
 
     while True:
         time.sleep(poll_interval)
 
         now = time.time()
+        # Auto-update check — exits the process on a successful pull so launchd
+        # KeepAlive respawns us on the new code. Failures are logged and ignored.
+        if auto_update_minutes > 0 and (now - last_update_check) / 60.0 >= auto_update_minutes:
+            stamp = utc_now().strftime("%H:%M:%S")
+            auto_update_check(stamp)
+            last_update_check = time.time()
+
         if now - last_push >= heartbeat_seconds:
             stamp = utc_now().strftime("%H:%M:%S")
             print(f"[{stamp}] heartbeat push", flush=True)
@@ -751,6 +829,15 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Print the snapshot JSON instead of POSTing. Skips token + URL checks.",
+    )
+    p.add_argument(
+        "--no-auto-update",
+        action="store_true",
+        help=(
+            "Disable the periodic `git pull` cycle. Equivalent to setting "
+            "FORTYTWO_AUTOUPDATE_MINUTES=0. Default cadence is 30 min; override "
+            "with FORTYTWO_AUTOUPDATE_MINUTES=N (integer minutes; 0 disables)."
+        ),
     )
     return p.parse_args()
 

@@ -285,14 +285,44 @@ Get-Content $env:USERPROFILE\FortytwoBot\agent\agent.log -Tail 20 -Wait
 tail -f ~/Library/Logs/fortytwo-agent.log
 ```
 
-You should see a `push ok:` line every ~30 seconds (heartbeat) plus an extra
-one on each inference event.
+You should see a `push ok:` line every ~5 min (heartbeat) plus an extra one
+on each inference event. You'll also see `auto-update:` lines every 30 min
+when the cycle runs.
 
-> **Why no auto-update?** This repo is still in beta — a bad commit landing on
-> `main` would silently propagate to every node with no rollback. Manual pulls
-> keep you in control. If you'd like an opt-in auto-update later (e.g. a flag
-> that polls `git ls-remote` every 30 min and exits to let the task restart
-> with the new code), file an issue.
+### Auto-update
+
+The agent self-pulls from `origin/main` every **30 minutes** by default. When
+a new commit lands, the agent:
+
+1. Runs `git pull --ff-only` in its repo directory.
+2. On success, exits — the Scheduled Task / launchd `KeepAlive` respawns
+   the agent with the new code within seconds.
+
+You'll see this in `agent.log`:
+
+```
+[14:32:01] auto-update: remote a1b2c3d differs from local, pulling…
+[14:32:02] auto-update: pulled, exiting to restart with new code
+```
+
+**Change the cadence:** set `FORTYTWO_AUTOUPDATE_MINUTES=N` in the environment
+(integer minutes; `0` disables). For example, `FORTYTWO_AUTOUPDATE_MINUTES=10`
+checks every 10 min.
+
+**Disable per-install:**
+
+- Windows: re-run `install-as-task.ps1` with the `-NoAutoUpdate` switch (or
+  edit the task arguments in Task Scheduler).
+- macOS: add `--no-auto-update` to the agent invocation in
+  `~/Library/LaunchAgents/com.fortytwo.agent.plist` and reload it.
+
+**Local modifications** (forked / custom commits): `git pull --ff-only` will
+fail safely instead of merging. The agent logs the failure and keeps running
+on your current code — auto-update never clobbers local work.
+
+The "Update (pull latest + restart)" command above is still useful when you
+want a fix immediately and don't want to wait up to 30 min for the next
+auto-update cycle.
 
 ---
 

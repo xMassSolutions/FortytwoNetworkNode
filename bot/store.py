@@ -6,6 +6,9 @@ from typing import Any
 class Snapshot:
     received_at: float
     ts: str = ""
+    # Short git SHA of the agent's checked-out code — surfaces in dashboard
+    # so operators can see which version each node is running.
+    agent_version: str | None = None
     model: str | None = None
     model_short: str | None = None
     model_size_gb: float | None = None
