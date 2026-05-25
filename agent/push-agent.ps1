@@ -410,35 +410,49 @@ function Get-NodeSnapshot {
     }
     # Model file size on disk (GB).
     # The Capsule's "Using local LLM model: <path>" line may give a bare
-    # filename or a full path. On a typical install the GGUF lives in an
+    # filename or a full path. On the user's install the GGUF lives in an
     # HF cache layout like
     # <ScriptsRoot>\FortytwoNode\model_cache\models--<org>--<repo>\snapshots\<sha>\<file>.gguf
     # The <sha> changes between model updates so we can't hardcode it.
     #
-    # Strategy: try direct paths first; if not found, search the HF cache
-    # root (fast, bounded) then fall back to ScriptsRoot (whole tree).
-    # v8.2 used -Depth + -Filter which silently returned nothing on the
-    # user's setup -- v8.7 drops both in favor of a plain -Recurse -File
-    # + Where-Object Name -eq which is exact-match and works regardless
-    # of depth.
+    # v8.9 strategy: walk the HF cache layout EXPLICITLY (no -Recurse).
+    # v8.7's -Recurse approach silently returned nothing on this setup,
+    # likely because Get-ChildItem -Recurse was descending into the
+    # blobs/ subdir and an error mid-walk aborted the enumeration. The
+    # explicit walk only enumerates 3 directory levels and never
+    # touches blobs/. Falls back to v8.7's recursive search under
+    # ScriptsRoot as a last resort if the HF layout doesn't match.
     if ($model) {
         $modelPath = $null
         if (Test-Path -LiteralPath $model)                              { $modelPath = $model }
         elseif (Test-Path -LiteralPath (Join-Path $ScriptsRoot $model)) { $modelPath = (Join-Path $ScriptsRoot $model) }
+        # Explicit walk: model_cache -> models--*/ -> snapshots/ -> <sha>/ -> <file>
         if (-not $modelPath -and $modelShort) {
-            $candidateRoots = @(
-                (Join-Path $ScriptsRoot "FortytwoNode\model_cache"),  # known HF cache layout, fast
-                $ScriptsRoot                                            # fallback, whole tree
-            )
-            foreach ($root in $candidateRoots) {
-                if (-not (Test-Path -LiteralPath $root)) { continue }
-                try {
-                    $hit = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
-                           Where-Object { $_.Name -eq $modelShort -and $_.Length -gt 0 } |
-                           Select-Object -First 1
-                    if ($hit) { $modelPath = $hit.FullName; break }
-                } catch { }
+            $cachePath = Join-Path $ScriptsRoot "FortytwoNode\model_cache"
+            if (Test-Path -LiteralPath $cachePath) {
+                foreach ($modelDir in @(Get-ChildItem -LiteralPath $cachePath -Directory -ErrorAction SilentlyContinue)) {
+                    $snapsDir = Join-Path $modelDir.FullName "snapshots"
+                    if (-not (Test-Path -LiteralPath $snapsDir)) { continue }
+                    foreach ($shaDir in @(Get-ChildItem -LiteralPath $snapsDir -Directory -ErrorAction SilentlyContinue)) {
+                        $maybe = Join-Path $shaDir.FullName $modelShort
+                        if (Test-Path -LiteralPath $maybe) {
+                            $modelPath = $maybe
+                            break
+                        }
+                    }
+                    if ($modelPath) { break }
+                }
             }
+        }
+        # Last resort: full recursive search under ScriptsRoot (slow but
+        # catches non-HF layouts -- e.g. user manually placed the model).
+        if (-not $modelPath -and $modelShort) {
+            try {
+                $hit = Get-ChildItem -LiteralPath $ScriptsRoot -Recurse -File -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -eq $modelShort -and $_.Length -gt 0 } |
+                       Select-Object -First 1
+                if ($hit) { $modelPath = $hit.FullName }
+            } catch { }
         }
         if ($modelPath) {
             try {
