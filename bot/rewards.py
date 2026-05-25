@@ -352,8 +352,13 @@ class RewardsTracker:
         except Exception:
             return rounds
 
+        # Exclude any tx_hash that's already claimed by a round (e.g., the
+        # agent attached it via the legacy "receipt hash 0x..." log line).
+        # Without this, the matcher would re-attach the same tx to a second
+        # round that happens to have an overlapping interval window.
+        already_claimed: set[str] = {r["tx_hash"] for r in rounds if r.get("tx_hash")}
         avail: list[tuple[int, str]] = sorted(
-            [(t.ts, t.tx_hash) for t in self.today_transfers],
+            [(t.ts, t.tx_hash) for t in self.today_transfers if t.tx_hash not in already_claimed],
             key=lambda x: x[0],
         )
         used: set[int] = set()

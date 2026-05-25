@@ -491,9 +491,31 @@ function Get-NodeSnapshot {
         if ($modelPath) {
             $modelDebug.found_at = $modelPath
             try {
-                $size = (Get-Item -LiteralPath $modelPath).Length
+                $size = (Get-Item -LiteralPath $modelPath -Force).Length
                 $modelDebug.size_bytes = $size
-                if ($size -gt 0) { $modelSizeGb = [math]::Round($size / 1GB, 2) }
+                if ($size -gt 0) {
+                    $modelSizeGb = [math]::Round($size / 1GB, 2)
+                } else {
+                    # v9.2 fallback: HF on Windows stores the snapshot file as
+                    # a reparse-point/symlink to ../../blobs/<sha>. PowerShell's
+                    # .Length on the symlink itself returns 0, not the target's
+                    # size. Walk to the blobs/ dir under the same model_cache
+                    # entry and use the largest file (the GGUF blob).
+                    try {
+                        $blobsDir = Split-Path (Split-Path (Split-Path $modelPath -Parent) -Parent) -Parent
+                        $blobsDir = Join-Path $blobsDir "blobs"
+                        if (Test-Path -LiteralPath $blobsDir) {
+                            $largest = Get-ChildItem -LiteralPath $blobsDir -File -Force -ErrorAction SilentlyContinue |
+                                       Sort-Object Length -Descending |
+                                       Select-Object -First 1
+                            if ($largest -and $largest.Length -gt 0) {
+                                $modelSizeGb = [math]::Round($largest.Length / 1GB, 2)
+                                $modelDebug.blob_fallback = $largest.FullName
+                                $modelDebug.size_bytes = $largest.Length
+                            }
+                        }
+                    } catch { $modelDebug.error = "blob fallback: $($_.Exception.Message)" }
+                }
             } catch { $modelDebug.error = "Get-Item: $($_.Exception.Message)" }
         }
     }
