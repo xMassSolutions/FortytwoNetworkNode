@@ -72,11 +72,22 @@ class RewardsTracker:
     today_midnight_ts: int | None = None
     today_midnight_block: int | None = None
     today_transfers: list[_Transfer] = field(default_factory=list)
+    # Yesterday's transfers — preserved across UTC-midnight rollover so the
+    # 24h rounds chart's earlier bars (which span yesterday's hours) can
+    # show real FOR/hour in their tooltips instead of "—".
+    # Caveat: lost on Render redeploy until the next midnight rollover.
+    yesterday_transfers: list[_Transfer] = field(default_factory=list)
+    yesterday_utc_date: str | None = None
     last_scanned_block: int | None = None
     last_refresh_ts: float = 0.0
     last_error: str | None = None
 
     def _reset_for_new_day(self) -> None:
+        # Roll today -> yesterday before clearing so the 24h chart keeps
+        # yesterday's per-hour data available for tooltips.
+        if self.today_transfers and self.today_utc_date:
+            self.yesterday_transfers = self.today_transfers
+            self.yesterday_utc_date = self.today_utc_date
         self.today_utc_date = _utc_today_str()
         self.today_midnight_ts = _utc_midnight_ts()
         self.today_midnight_block = None
@@ -361,11 +372,13 @@ class RewardsTracker:
         earned = sum(t.amount for t in self.today_transfers)
         count = len(self.today_transfers)
         last = self.today_transfers[-1] if self.today_transfers else None
-        # Bucket today's transfers by UTC hour. Keys match the agent's
-        # rounds_history format ("YYYY-MM-DDTHH") so the dashboard's bucket()
-        # helper can reuse the same lookup pattern for tooltips.
+        # Bucket transfers by UTC hour. Keys match the agent's
+        # rounds_history format ("YYYY-MM-DDTHH") so the dashboard's
+        # bucket() helper can reuse the same lookup pattern for tooltips.
+        # Includes BOTH today and yesterday so 24h chart bars that span
+        # the UTC-midnight boundary show real FOR data instead of "—".
         by_hour: dict[str, float] = {}
-        for t in self.today_transfers:
+        for t in (*self.today_transfers, *self.yesterday_transfers):
             dt = datetime.fromtimestamp(t.ts, tz=timezone.utc)
             key = dt.strftime("%Y-%m-%dT%H")
             by_hour[key] = by_hour.get(key, 0.0) + t.amount
