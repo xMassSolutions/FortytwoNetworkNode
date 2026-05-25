@@ -395,6 +395,25 @@ To remove the bot service: Render dashboard → service → **Settings** → **D
 
 ---
 
+## Contributing
+
+This repo ships a pre-commit hook at `.githooks/pre-commit` that blocks
+any commit containing non-ASCII characters in a `.ps1` file. PowerShell 5.1
+on Windows reads `.ps1` files as cp1252 unless a UTF-8 BOM is present, so a
+single em-dash in a comment can break the parser and take the agent offline
+(it has, twice).
+
+Enable the hook **once** in your local clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+(One-time per clone. The hook itself is versioned in the repo and picked up
+automatically once this config is set.)
+
+---
+
 ## License
 
 [MIT](LICENSE) © 2026 xMassSolutions — see the [LICENSE](LICENSE) file for full text.

@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Pre-commit hook: reject any staged .ps1 file that contains non-ASCII chars.
+
+Why: PowerShell 5.1 on Windows reads .ps1 files as cp1252 unless a UTF-8 BOM
+is present. Non-ASCII chars (em-dash, ellipsis, smart quotes, etc.) get
+mangled mid-byte and break the script parser, taking the agent offline.
+See repo history v8.0/v8.1 and v9.1/v9.1.1 for the two times this hit us
+in production before this hook existed.
+
+To enable on a clone:
+    git config core.hooksPath .githooks
+
+To bypass for a known-safe commit (rarely needed):
+    git commit --no-verify ...
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+
+
+def staged_ps1_files() -> list[str]:
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return [f for f in result.stdout.splitlines() if f.endswith(".ps1")]
+
+
+def main() -> int:
+    files = staged_ps1_files()
+    if not files:
+        return 0
+
+    errors: list[tuple[str, int, int, str, int, str]] = []
+    for path in files:
+        try:
+            content = open(path, encoding="utf-8").read()
+        except FileNotFoundError:
+            continue  # file deleted in this commit
+        except UnicodeDecodeError as e:
+            # File isn't even valid UTF-8 — definitely block.
+            errors.append((path, 0, 0, "?", 0, f"file is not valid UTF-8: {e}"))
+            continue
+        for line_no, line in enumerate(content.splitlines(), 1):
+            for col_no, ch in enumerate(line, 1):
+                if ord(ch) > 127:
+                    errors.append((path, line_no, col_no, ch, ord(ch), line.rstrip()[:140]))
+                    break  # one report per line is enough
+
+    if not errors:
+        return 0
+
+    print()
+    print("  COMMIT BLOCKED: non-ASCII characters in PowerShell file(s).")
+    print()
+    print("  PowerShell 5.1 reads .ps1 files as cp1252 unless a UTF-8 BOM is")
+    print("  present. Non-ASCII chars get mangled and break the parser,")
+    print("  taking the agent offline.")
+    print()
+    for path, ln, col, ch, ordn, snippet in errors:
+        loc = f"{path}:{ln}:{col}" if ln else path
+        print(f"  {loc}  {ch!r} (U+{ordn:04X})")
+        if snippet:
+            print(f"    {snippet}")
+    print()
+    print("  Fix: replace non-ASCII with ASCII equivalents.")
+    print("    em-dash (-)         -> double-hyphen (--)")
+    print("    ellipsis (...)      -> three dots (...)")
+    print("    smart quotes        -> straight ASCII quotes")
+    print()
+    print("  To bypass for a known-safe commit (you'll regret this):")
+    print("    git commit --no-verify ...")
+    print()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
