@@ -57,31 +57,48 @@ The block is informational — copy it into another LLM session if you want the 
 
 ## Manual install
 
-### 1. Deploy the bot to Render
+### 1. Deploy the bot
 
-1. Fork this repo to your GitHub account.
+Pick one host — the dashboard is identical either way. Both options are free-tier friendly.
+
+First, generate an `AGENT_TOKEN` you'll reuse across both the bot and the agent:
+
+```bash
+# macOS / Linux
+openssl rand -hex 20
+
+# Windows (PowerShell)
+-join ((48..57)+(97..122) | Get-Random -Count 40 | ForEach-Object {[char]$_})
+```
+
+#### Render (Blueprint)
+
+1. Fork this repo.
 2. Sign up at <https://render.com> (free tier, no card required).
-3. In Render, click **New +** → **Blueprint** → connect your forked repo. Render auto-detects `render.yaml`.
-4. Render will prompt you for these env vars (all marked `sync: false` so you set them per deploy):
+3. In Render, click **New +** → **Blueprint** → connect your fork. Render auto-detects `render.yaml`.
+4. Set the two env vars Render asks for (`sync: false`):
 
    | Var | Required | What to put |
    |---|---|---|
    | `WALLET` | yes | Your Monad Testnet operator wallet (`0x…`) |
-   | `AGENT_TOKEN` | yes | Random 32+ char shared secret — generate one |
-
-   Generate an `AGENT_TOKEN`:
-
-   ```bash
-   # macOS / Linux
-   openssl rand -hex 20
-
-   # Windows (PowerShell)
-   -join ((48..57)+(97..122) | Get-Random -Count 40 | ForEach-Object {[char]$_})
-   ```
+   | `AGENT_TOKEN` | yes | The shared secret you generated above |
 
 5. **Apply**. First build is 3–5 min (Docker image build).
 6. Verify: open `https://<service>.onrender.com/healthz` — should return `{"ok":true}`.
-7. (Optional) **Custom domain**: in Render → service → **Settings** → **Custom Domains**, add your domain. Render gives you the DNS records to configure with your registrar.
+7. (Optional) **Custom domain**: Render → service → **Settings** → **Custom Domains**.
+
+#### Railway (alternative)
+
+1. Fork this repo.
+2. Sign up at <https://railway.app>.
+3. **New Project** → **Deploy from GitHub repo** → pick your fork.
+4. In the service's **Settings**, set **Root Directory** to `bot`. Railpack scans the repo root by default and can't find the Dockerfile (it lives in `bot/`). The `railway.json` at repo root configures the rest (Dockerfile path, healthcheck, restart policy).
+5. **Variables** → add `WALLET` and `AGENT_TOKEN` (same values as the Render flow).
+6. Deploy. First build is 3–5 min.
+7. Verify: open `https://<your-app>.up.railway.app/healthz` → `{"ok":true}`.
+8. (Optional) Generate a custom domain under **Settings** → **Networking**.
+
+The agent install step below uses whichever URL your bot ended up on. Both Render and Railway are tested with the same `bot/Dockerfile`.
 
 ### 2. Install the workstation agent
 
@@ -139,6 +156,51 @@ Uninstall:
 
 ```bash
 ./uninstall-mac.sh
+```
+
+#### Linux
+
+In a terminal on the box running your FortyTwo node:
+
+```bash
+cd ~
+git clone https://github.com/<your-fork>/FortytwoBot
+cd FortytwoBot/agent
+./install-linux.sh \
+    "https://<service>.onrender.com" \
+    "<your-agent-token>" \
+    "$HOME/path/to/fortytwo-p2p-inference-scripts-main"
+```
+
+This writes a **systemd `--user`** unit at `~/.config/systemd/user/fortytwo-agent.service`, enables it, and starts it. The agent restarts on failure (30 s back-off) and writes logs to `~/.cache/fortytwo-agent.log`.
+
+If the box is headless or you want the agent to survive logout, enable lingering once:
+
+```bash
+loginctl enable-linger $USER
+```
+
+Verify pushes:
+
+```bash
+tail -f ~/.cache/fortytwo-agent.log
+# or:
+systemctl --user status fortytwo-agent
+```
+
+For a **system-wide** install (root, no logged-in user required — useful for unattended servers):
+
+```bash
+FORTYTWO_SYSTEMD_SCOPE=system sudo -E ./install-linux.sh <args>
+```
+
+Unit lives at `/etc/systemd/system/fortytwo-agent.service`, logs go to `/var/log/fortytwo-agent.log`. Manage with `sudo systemctl …` (no `--user`).
+
+Uninstall:
+
+```bash
+systemctl --user disable --now fortytwo-agent
+rm ~/.config/systemd/user/fortytwo-agent.service
 ```
 
 #### Docker (FortyTwo node runs in a container)
@@ -205,13 +267,14 @@ The helper script does `git pull`, cleanly ends the scheduled task, kills any
 stray `push-agent.ps1` processes, restarts the task, and tails the agent log
 so you can confirm the bootstrap push.
 
-**macOS:**
+**macOS / Linux:**
 
 ```bash
 cd ~/FortytwoBot
-git pull
-launchctl kickstart -k gui/$(id -u)/com.fortytwo.agent
+./agent/update-agent.sh
 ```
+
+The helper script does `git pull` and restarts whichever service is running (launchd on macOS, systemd `--user` or system on Linux), then tails the agent log.
 
 ### Restart (no code change)
 
@@ -222,14 +285,21 @@ Stop-ScheduledTask  -TaskName FortytwoBotAgent
 Start-ScheduledTask -TaskName FortytwoBotAgent
 ```
 
-(Or run `.\agent\update-agent.ps1` for the full pull+restart with stray
-cleanup — it works even when there's nothing to pull.)
+(Or run `.\agent\update-agent.ps1` for the full pull+restart with stray cleanup — it works even when there's nothing to pull.)
 
 **macOS:**
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.fortytwo.agent
 ```
+
+**Linux** (systemd `--user`):
+
+```bash
+systemctl --user restart fortytwo-agent
+```
+
+(For system-wide installs: `sudo systemctl restart fortytwo-agent`.)
 
 ### Stop
 
@@ -245,6 +315,12 @@ Stop-ScheduledTask -TaskName FortytwoBotAgent
 launchctl unload ~/Library/LaunchAgents/com.fortytwo.agent.plist
 ```
 
+**Linux:**
+
+```bash
+systemctl --user stop fortytwo-agent
+```
+
 ### Start (after stop)
 
 **Windows:**
@@ -257,6 +333,12 @@ Start-ScheduledTask -TaskName FortytwoBotAgent
 
 ```bash
 launchctl load ~/Library/LaunchAgents/com.fortytwo.agent.plist
+```
+
+**Linux:**
+
+```bash
+systemctl --user start fortytwo-agent
 ```
 
 ### Status (is it running?)
@@ -277,6 +359,14 @@ launchctl list | grep com.fortytwo.agent
 
 First column is the PID (or `-` if not running); second is the last exit code.
 
+**Linux:**
+
+```bash
+systemctl --user status fortytwo-agent
+```
+
+Shows current state (active/inactive/failed), PID, recent log lines.
+
 ### View live logs
 
 **Windows:**
@@ -289,6 +379,14 @@ Get-Content $env:USERPROFILE\FortytwoBot\agent\agent.log -Tail 20 -Wait
 
 ```bash
 tail -f ~/Library/Logs/fortytwo-agent.log
+```
+
+**Linux:**
+
+```bash
+tail -f ~/.cache/fortytwo-agent.log
+# or via journald (system-wide install):
+journalctl --user -u fortytwo-agent -f
 ```
 
 You should see a `push ok:` line every ~5 min (heartbeat) plus an extra one
@@ -317,10 +415,9 @@ checks every 10 min.
 
 **Disable per-install:**
 
-- Windows: re-run `install-as-task.ps1` with the `-NoAutoUpdate` switch (or
-  edit the task arguments in Task Scheduler).
-- macOS: add `--no-auto-update` to the agent invocation in
-  `~/Library/LaunchAgents/com.fortytwo.agent.plist` and reload it.
+- Windows: re-run `install-as-task.ps1` with the `-NoAutoUpdate` switch (or edit the task arguments in Task Scheduler).
+- macOS: add `--no-auto-update` to the agent invocation in `~/Library/LaunchAgents/com.fortytwo.agent.plist` and reload it.
+- Linux: edit `~/.config/systemd/user/fortytwo-agent.service`, append `--no-auto-update` to `ExecStart`, then `systemctl --user daemon-reload && systemctl --user restart fortytwo-agent`.
 
 **Local modifications** (forked / custom commits): `git pull --ff-only` will
 fail safely instead of merging. The agent logs the failure and keeps running
@@ -345,9 +442,11 @@ auto-update cycle.
 
 ### Agent params
 
-`install-as-task.ps1 -BotUrl <url> -AgentToken <token> -ScriptsRoot <path> [-TaskName ...]`
-
-`install-mac.sh <bot-url> <agent-token> <scripts-root>`
+| Platform | Installer |
+|---|---|
+| Windows | `install-as-task.ps1 -BotUrl <url> -AgentToken <token> -ScriptsRoot <path> [-TaskName ...] [-NoAutoUpdate]` |
+| macOS | `install-mac.sh <bot-url> <agent-token> <scripts-root> [docker-container]` |
+| Linux | `install-linux.sh <bot-url> <agent-token> <scripts-root> [docker-container]` (set `FORTYTWO_SYSTEMD_SCOPE=system` for system-wide install) |
 
 `-ScriptsRoot` / third arg is the path to your local `fortytwo-p2p-inference-scripts-main` directory (it's where `extended_log.txt` and `FortytwoNode/debug/FortytwoCapsule.log` live).
 

@@ -66,11 +66,10 @@ case "$(uname -s)" in
         LOG_PATH="$HOME/Library/Logs/fortytwo-agent.log"
         ;;
     Linux)
-        LAUNCH_DIR="$HOME/.config/systemd/user"  # Linux uses systemd, not launchd
-        LOG_PATH="$HOME/.cache/fortytwo-agent.log"
-        echo "WARNING: Linux detected. This installer only configures macOS launchd." >&2
-        echo "  Run the agent manually or write a systemd unit:" >&2
-        echo "  python3 $AGENT --bot-url $BOT_URL --agent-token <hidden> --scripts-root $SCRIPTS_ROOT" >&2
+        echo "Linux detected. Use install-linux.sh instead — it sets up a" >&2
+        echo "systemd --user service which is the proper Linux equivalent" >&2
+        echo "of macOS launchd:" >&2
+        echo "  ./install-linux.sh $BOT_URL <token> $SCRIPTS_ROOT${DOCKER_CONTAINER:+ $DOCKER_CONTAINER}" >&2
         exit 1
         ;;
     *)

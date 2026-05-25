@@ -1,0 +1,20 @@
+[Unit]
+Description=FortytwoBot node-monitoring agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# All placeholders get sed-substituted by install-linux.sh.
+ExecStart=/usr/bin/python3 {{AGENT_PATH}} --bot-url {{BOT_URL}} --agent-token {{AGENT_TOKEN}} --scripts-root {{SCRIPTS_ROOT}} {{EXTRA_ARGS}}
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:{{LOG_PATH}}
+StandardError=append:{{LOG_PATH}}
+# Keep the agent out of the node's way — low scheduling priority.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target
