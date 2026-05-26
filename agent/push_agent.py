@@ -871,54 +871,32 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
     last_pos = ext_log.stat().st_size if ext_log.exists() else 0
     last_update_check = time.time()  # don't auto-update on the first cycle — wait one interval
 
+    # Safety-net error tracking. The inner try/excepts already handle the
+    # common push/read failure modes, but an unexpected exception from
+    # e.g. get_node_snapshot (new Capsule log shape, scripts_root vanished,
+    # etc.) would otherwise kill the loop. launchd KeepAlive / systemd
+    # Restart=on-failure would respawn us, but if the same exception fires
+    # immediately on each restart the supervisor eventually gives up and
+    # the agent sits dormant — the v11.x "snapshot stale for 7 min with no
+    # recovery" symptom. Dedupe-log and keep looping instead.
+    last_loop_error: str | None = None
+    loop_error_suppressed = 0
+
     while True:
         time.sleep(poll_interval)
 
-        now = time.time()
-        # Auto-update check — exits the process on a successful pull so launchd
-        # KeepAlive respawns us on the new code. Failures are logged and ignored.
-        if auto_update_minutes > 0 and (now - last_update_check) / 60.0 >= auto_update_minutes:
-            stamp = utc_now().strftime("%H:%M:%S")
-            auto_update_check(stamp)
-            last_update_check = time.time()
-
-        if now - last_push >= heartbeat_seconds:
-            stamp = utc_now().strftime("%H:%M:%S")
-            print(f"[{stamp}] heartbeat push", flush=True)
-            try:
-                post_snapshot(
-                    args.bot_url,
-                    args.agent_token,
-                    get_node_snapshot(scripts_root, history_file, args.docker_container),
-                    node_id=args.node_id,
-                    wallet=args.wallet,
-                )
-                last_push = time.time()
-            except Exception as e:
-                print(f"[heartbeat] {e}", flush=True)
-
-        if not ext_log.exists():
-            continue
-
-        current_size = ext_log.stat().st_size
-        if current_size < last_pos:
-            last_pos = 0
-        if current_size <= last_pos:
-            continue
-
         try:
-            with ext_log.open("r", encoding="utf-8", errors="replace") as f:
-                f.seek(last_pos)
-                new_content = f.read()
-                last_pos = f.tell()
-        except Exception as e:
-            print(f"[read] {e}", flush=True)
-            continue
-
-        for line in new_content.split("\n"):
-            if EVENT_PATTERN_RE.search(line):
+            now = time.time()
+            # Auto-update check — exits the process on a successful pull so launchd
+            # KeepAlive respawns us on the new code. Failures are logged and ignored.
+            if auto_update_minutes > 0 and (now - last_update_check) / 60.0 >= auto_update_minutes:
                 stamp = utc_now().strftime("%H:%M:%S")
-                print(f"[{stamp}] inference event - pushing snapshot", flush=True)
+                auto_update_check(stamp)
+                last_update_check = time.time()
+
+            if now - last_push >= heartbeat_seconds:
+                stamp = utc_now().strftime("%H:%M:%S")
+                print(f"[{stamp}] heartbeat push", flush=True)
                 try:
                     post_snapshot(
                         args.bot_url,
@@ -929,7 +907,60 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
                     )
                     last_push = time.time()
                 except Exception as e:
-                    print(f"[event push] {e}", flush=True)
+                    print(f"[heartbeat] {e}", flush=True)
+
+            if ext_log.exists():
+                current_size = ext_log.stat().st_size
+                if current_size < last_pos:
+                    last_pos = 0  # rotated / truncated
+                if current_size > last_pos:
+                    new_content: str | None = None
+                    try:
+                        with ext_log.open("r", encoding="utf-8", errors="replace") as f:
+                            f.seek(last_pos)
+                            new_content = f.read()
+                            last_pos = f.tell()
+                    except Exception as e:
+                        print(f"[read] {e}", flush=True)
+                    if new_content:
+                        for line in new_content.split("\n"):
+                            if EVENT_PATTERN_RE.search(line):
+                                stamp = utc_now().strftime("%H:%M:%S")
+                                print(f"[{stamp}] inference event - pushing snapshot", flush=True)
+                                try:
+                                    post_snapshot(
+                                        args.bot_url,
+                                        args.agent_token,
+                                        get_node_snapshot(scripts_root, history_file, args.docker_container),
+                                        node_id=args.node_id,
+                                        wallet=args.wallet,
+                                    )
+                                    last_push = time.time()
+                                except Exception as e:
+                                    print(f"[event push] {e}", flush=True)
+
+            # Reached the bottom of the loop without an unhandled exception.
+            # If we were previously stuck in a repeat-error state, log the
+            # recovery and reset the dedupe state.
+            if last_loop_error is not None:
+                stamp = utc_now().strftime("%H:%M:%S")
+                print(
+                    f"[{stamp}] LOOP RECOVERED after {loop_error_suppressed} "
+                    f"suppressed similar errors. Last: {last_loop_error}",
+                    flush=True,
+                )
+                last_loop_error = None
+                loop_error_suppressed = 0
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            if msg == last_loop_error:
+                # Same error firing repeatedly — suppress to keep logs clean.
+                loop_error_suppressed += 1
+            else:
+                stamp = utc_now().strftime("%H:%M:%S")
+                print(f"[{stamp}] LOOP ERROR (continuing): {msg}", flush=True)
+                last_loop_error = msg
+                loop_error_suppressed = 0
 
 
 # ---------- CLI ----------

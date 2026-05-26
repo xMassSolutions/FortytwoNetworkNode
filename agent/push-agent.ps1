@@ -675,62 +675,95 @@ try {
 $lastPos = if (Test-Path $ExtLog) { (Get-Item $ExtLog).Length } else { 0 }
 $lastUpdateCheck = Get-Date  # don't auto-update on the first cycle -- wait one interval
 
+# Safety-net error tracking. The inner try/catches already handle the common
+# push/read failure modes, but an unexpected throw from e.g. Get-NodeSnapshot
+# (new Capsule log shape, ScriptsRoot disappeared, etc.) would otherwise kill
+# the loop and the Scheduled Task's "restart on failure" would exhaust its 3
+# retries leaving the agent dormant -- which is exactly the "snapshot stale
+# for 7 min with no recovery" symptom v11.x is fixing.
+$lastLoopError = $null
+$loopErrorSuppressed = 0
+
 while ($true) {
     Start-Sleep -Seconds $PollIntervalSeconds
 
-    # Auto-update check (every AutoUpdateMinutes). Runs git ls-remote / pull,
-    # and exit 0 on a successful pull so the scheduled task respawns us on
-    # the new code. Cheap (1 RPC per interval) and never crashes the agent.
-    if ($AutoUpdateMinutes -gt 0 -and ((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $AutoUpdateMinutes) {
-        Invoke-AutoUpdateCheck
-        $lastUpdateCheck = Get-Date
-    }
-
-    # Heartbeat (so bot snapshots survive its redeploys / silent periods)
-    if (((Get-Date) - $lastPushTime).TotalSeconds -ge $HeartbeatSeconds) {
-        $now = Get-Date -Format "HH:mm:ss"
-        Write-Output "[$now] heartbeat push"
-        try {
-            Post-Snapshot (Get-NodeSnapshot)
-            $lastPushTime = Get-Date
-        } catch {
-            Write-Output ("[heartbeat] " + $_.Exception.Message)
-        }
-    }
-
-    if (-not (Test-Path $ExtLog)) { continue }
-    $currentSize = (Get-Item $ExtLog).Length
-    if ($currentSize -lt $lastPos) { $lastPos = 0 }  # rotated / truncated
-    if ($currentSize -le $lastPos) { continue }
-
-    # Read new bytes from $lastPos to EOF
     try {
-        $fs = [System.IO.File]::Open(
-            $ExtLog,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::ReadWrite
-        )
-        $fs.Position = $lastPos
-        $sr = New-Object System.IO.StreamReader($fs)
-        $newContent = $sr.ReadToEnd()
-        $lastPos = $fs.Position
-        $sr.Close(); $fs.Close()
-    } catch {
-        Write-Output ("[read] " + $_.Exception.Message)
-        continue
-    }
+        # Auto-update check (every AutoUpdateMinutes). Runs git ls-remote / pull,
+        # and exit 0 on a successful pull so the scheduled task respawns us on
+        # the new code. Cheap (1 RPC per interval) and never crashes the agent.
+        if ($AutoUpdateMinutes -gt 0 -and ((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $AutoUpdateMinutes) {
+            Invoke-AutoUpdateCheck
+            $lastUpdateCheck = Get-Date
+        }
 
-    foreach ($line in ($newContent -split "`n")) {
-        if ($line -match $EventPattern) {
+        # Heartbeat (so bot snapshots survive its redeploys / silent periods)
+        if (((Get-Date) - $lastPushTime).TotalSeconds -ge $HeartbeatSeconds) {
             $now = Get-Date -Format "HH:mm:ss"
-            Write-Output "[$now] inference event - pushing snapshot"
+            Write-Output "[$now] heartbeat push"
             try {
                 Post-Snapshot (Get-NodeSnapshot)
                 $lastPushTime = Get-Date
             } catch {
-                Write-Output ("[event push] " + $_.Exception.Message)
+                Write-Output ("[heartbeat] " + $_.Exception.Message)
             }
+        }
+
+        if (Test-Path $ExtLog) {
+            $currentSize = (Get-Item $ExtLog).Length
+            if ($currentSize -lt $lastPos) { $lastPos = 0 }  # rotated / truncated
+            if ($currentSize -gt $lastPos) {
+                # Read new bytes from $lastPos to EOF
+                $newContent = $null
+                try {
+                    $fs = [System.IO.File]::Open(
+                        $ExtLog,
+                        [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read,
+                        [System.IO.FileShare]::ReadWrite
+                    )
+                    $fs.Position = $lastPos
+                    $sr = New-Object System.IO.StreamReader($fs)
+                    $newContent = $sr.ReadToEnd()
+                    $lastPos = $fs.Position
+                    $sr.Close(); $fs.Close()
+                } catch {
+                    Write-Output ("[read] " + $_.Exception.Message)
+                }
+                if ($newContent) {
+                    foreach ($line in ($newContent -split "`n")) {
+                        if ($line -match $EventPattern) {
+                            $now = Get-Date -Format "HH:mm:ss"
+                            Write-Output "[$now] inference event - pushing snapshot"
+                            try {
+                                Post-Snapshot (Get-NodeSnapshot)
+                                $lastPushTime = Get-Date
+                            } catch {
+                                Write-Output ("[event push] " + $_.Exception.Message)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # Reached the bottom of the loop without an unhandled exception. If we
+        # were previously stuck in a repeat-error state, log the recovery.
+        if ($lastLoopError) {
+            $now = Get-Date -Format "HH:mm:ss"
+            Write-Output ("[$now] LOOP RECOVERED after {0} suppressed similar errors. Last: {1}" -f $loopErrorSuppressed, $lastLoopError)
+            $lastLoopError = $null
+            $loopErrorSuppressed = 0
+        }
+    } catch {
+        $msg = "{0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message
+        if ($msg -eq $lastLoopError) {
+            # Same error firing repeatedly -- suppress to keep agent.log clean.
+            $loopErrorSuppressed += 1
+        } else {
+            $now = Get-Date -Format "HH:mm:ss"
+            Write-Output ("[$now] LOOP ERROR (continuing): $msg")
+            $lastLoopError = $msg
+            $loopErrorSuppressed = 0
         }
     }
 }
