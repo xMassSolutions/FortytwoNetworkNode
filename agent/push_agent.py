@@ -279,7 +279,13 @@ CAPABILITY_LINE_RE = re.compile(
     r"has max tokens per second:\s*(\d+),?\s*max symbols per second:\s*(\d+)"
 )
 MODEL_LOCAL_RE = re.compile(r"Using local LLM model: (.+)$")
-MODEL_HF_RE = re.compile(r"--llm-hf-model-name\s+(\S+)")
+# Two formats:
+#   --llm-hf-model-name <file>      (bare-metal CLI invocation)
+#   LLM model name <file>           (capsule's own startup banner — used when
+#                                    the model is configured via env vars
+#                                    FT_CAPSULE_LLM_HF_MODEL_NAME, e.g. WSL
+#                                    native install)
+MODEL_HF_RE = re.compile(r"(?:--llm-hf-model-name\s+|LLM model name\s+)(\S+\.gguf)")
 CAPSULE_VERSION_RE = re.compile(r"Fortytwo Capsule current version: (\S+)")
 PROTOCOL_VERSION_RE = re.compile(
     r"(?:Protocol version|protocol.+version)[:\s]+v?(\d+\.\d+\.\d+)"
@@ -302,9 +308,30 @@ def read_text(path: Path) -> str:
 
 
 def find_pid(name: str) -> int | None:
+    # First try exact-match against /proc/<pid>/comm (`pgrep -x`). This is fast
+    # and unambiguous, BUT Linux truncates comm to 15 chars (TASK_COMM_LEN-1),
+    # so anything ≥ 16 chars — e.g. "FortytwoProtocol" — would never match.
+    # Fall back to full-cmdline match (`pgrep -f`) using a path-anchored
+    # pattern so we don't also match shells/greps that happen to mention the
+    # name in their arguments.
     try:
         result = subprocess.run(
             ["pgrep", "-x", name], capture_output=True, text=True, timeout=3
+        )
+        if result.returncode == 0:
+            line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+            if line:
+                return int(line)
+    except Exception:
+        pass
+    try:
+        # `[/]Foo` matches the literal "/Foo" in any process cmdline without
+        # the grep/pgrep process itself matching its own command line.
+        result = subprocess.run(
+            ["pgrep", "-f", f"[/]{name}( |$)"],
+            capture_output=True,
+            text=True,
+            timeout=3,
         )
         if result.returncode == 0:
             line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
@@ -395,7 +422,13 @@ def get_docker_process_info(container: str | None) -> dict[str, Any]:
 # ---------- ready probe ----------
 
 
-def capsule_ready(url: str = "http://localhost:42442/ready") -> bool:
+def capsule_ready(url: str | None = None) -> bool:
+    # Default to the bare-metal capsule's HTTP port (42442). For multi-node
+    # installs (e.g. WSL node 2 on a different port), set FT_CAPSULE_HTTP_PORT
+    # in the agent's environment and we'll probe that port instead.
+    if url is None:
+        port = os.environ.get("FT_CAPSULE_HTTP_PORT", "42442")
+        url = f"http://localhost:{port}/ready"
     try:
         req = urllib.request.Request(url)
         with urllib.request.urlopen(req, timeout=3) as resp:
@@ -749,7 +782,19 @@ def get_node_snapshot(
 # ---------- HTTP push ----------
 
 
-def post_snapshot(bot_url: str, agent_token: str, snap: dict[str, Any]) -> None:
+def post_snapshot(
+    bot_url: str,
+    agent_token: str,
+    snap: dict[str, Any],
+    node_id: int = 1,
+    wallet: str | None = None,
+) -> None:
+    # Multi-node support: stamp the payload so the bot can bucket this push
+    # by node_id. Legacy callers without these kwargs get node_id=1, matching
+    # the bot's StatusPayload default for un-upgraded agents.
+    snap["node_id"] = node_id
+    if wallet:
+        snap["wallet"] = wallet
     body = json.dumps(snap).encode("utf-8")
     url = bot_url.rstrip("/") + "/v1/status"
     req = urllib.request.Request(
@@ -766,7 +811,8 @@ def post_snapshot(bot_url: str, agent_token: str, snap: dict[str, Any]) -> None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             tag = "ok" if resp.status == 200 else f"HTTP {resp.status}"
             print(
-                f"[{stamp}] push {tag}: participations={snap['rounds_participated_today']} "
+                f"[{stamp}] push {tag} node={snap.get('node_id', 1)}: "
+                f"participations={snap['rounds_participated_today']} "
                 f"model={snap.get('model_short')} "
                 f"alive={snap['capsule_alive']}/{snap['protocol_alive']}",
                 flush=True,
@@ -811,7 +857,13 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
     # Bootstrap push
     last_push = 0.0
     try:
-        post_snapshot(args.bot_url, args.agent_token, get_node_snapshot(scripts_root, history_file, args.docker_container))
+        post_snapshot(
+            args.bot_url,
+            args.agent_token,
+            get_node_snapshot(scripts_root, history_file, args.docker_container),
+            node_id=args.node_id,
+            wallet=args.wallet,
+        )
         last_push = time.time()
     except Exception as e:
         print(f"[bootstrap] {e}", flush=True)
@@ -835,7 +887,11 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
             print(f"[{stamp}] heartbeat push", flush=True)
             try:
                 post_snapshot(
-                    args.bot_url, args.agent_token, get_node_snapshot(scripts_root, history_file, args.docker_container)
+                    args.bot_url,
+                    args.agent_token,
+                    get_node_snapshot(scripts_root, history_file, args.docker_container),
+                    node_id=args.node_id,
+                    wallet=args.wallet,
                 )
                 last_push = time.time()
             except Exception as e:
@@ -868,6 +924,8 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
                         args.bot_url,
                         args.agent_token,
                         get_node_snapshot(scripts_root, history_file, args.docker_container),
+                        node_id=args.node_id,
+                        wallet=args.wallet,
                     )
                     last_push = time.time()
                 except Exception as e:
@@ -888,6 +946,25 @@ def parse_args() -> argparse.Namespace:
         "--agent-token",
         default=os.environ.get("FORTYTWO_AGENT_TOKEN"),
         help="Shared secret. Defaults to FORTYTWO_AGENT_TOKEN env.",
+    )
+    p.add_argument(
+        "--node-id",
+        type=int,
+        default=int(os.environ.get("FORTYTWO_NODE_ID", "1")),
+        help=(
+            "Numeric node identifier (1, 2, ...). Defaults to FORTYTWO_NODE_ID env or 1. "
+            "Use a distinct integer per machine/install so the bot can show each node "
+            "as its own card on the dashboard."
+        ),
+    )
+    p.add_argument(
+        "--wallet",
+        default=os.environ.get("FORTYTWO_WALLET"),
+        help=(
+            "Operator wallet address for this node (e.g. 0xdDaF...). Defaults to "
+            "FORTYTWO_WALLET env. Optional — the bot falls back to its own WALLET env "
+            "var when this is omitted (legacy single-node behavior)."
+        ),
     )
     p.add_argument(
         "--scripts-root",
@@ -949,7 +1026,13 @@ def main() -> int:
         return 0
 
     if args.once:
-        post_snapshot(args.bot_url, args.agent_token, get_node_snapshot(scripts_root, history_file, args.docker_container))
+        post_snapshot(
+            args.bot_url,
+            args.agent_token,
+            get_node_snapshot(scripts_root, history_file, args.docker_container),
+            node_id=args.node_id,
+            wallet=args.wallet,
+        )
         return 0
 
     try:
