@@ -5,6 +5,13 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$ScriptsRoot,
     [string]$DockerContainer = $env:FORTYTWO_DOCKER_CONTAINER,
+    # Numeric node identifier sent in every push. Lets one dashboard serve N
+    # nodes (each on /dashboard/<NodeId>). Defaults to 1 so an unconfigured
+    # agent behaves exactly like before.
+    [int]$NodeId = $(if ($env:FORTYTWO_NODE_ID) { [int]$env:FORTYTWO_NODE_ID } else { 1 }),
+    # Operator wallet for THIS node. When empty, the server falls back to its
+    # own WALLET env var (back-compat for un-upgraded agents).
+    [string]$NodeWallet = $env:FORTYTWO_NODE_WALLET,
     [switch]$Once,
     [switch]$DryRun,
     [switch]$NoAutoUpdate   # disable git ls-remote/pull cycle entirely
@@ -573,8 +580,9 @@ function Get-NodeSnapshot {
     $logExtended = Get-LogTail $ExtLog 500
     $logCapsule  = Get-LogTail $CapsuleLog 500
 
-    return [ordered]@{
+    $snap = [ordered]@{
         ts                          = (Get-Date).ToUniversalTime().ToString("o")
+        node_id                     = $NodeId
         agent_version               = (Get-AgentVersion)
         model                       = $model
         model_short                 = $modelShort
@@ -612,6 +620,11 @@ function Get-NodeSnapshot {
         log_extended                = @($logExtended)
         log_capsule                 = @($logCapsule)
     }
+    # Only include node_wallet when configured. An empty string would fail the
+    # server's hex-address validator; the server falls back to its WALLET env
+    # var when the field is missing entirely.
+    if ($NodeWallet) { $snap.node_wallet = $NodeWallet }
+    return $snap
 }
 
 function Post-Snapshot($snap) {

@@ -6,6 +6,12 @@ from typing import Any
 class Snapshot:
     received_at: float
     ts: str = ""
+    # Numeric node identifier. Default 1 preserves single-node behavior for
+    # legacy agents that don't send the field.
+    node_id: int = 1
+    # Per-node operator wallet. When None, callers fall back to the server's
+    # WALLET env var (back-compat for un-upgraded agents).
+    node_wallet: str | None = None
     # Short git SHA of the agent's checked-out code — surfaces in dashboard
     # so operators can see which version each node is running.
     agent_version: str | None = None
@@ -54,14 +60,20 @@ class Snapshot:
 
 class Store:
     def __init__(self) -> None:
-        self._latest: Snapshot | None = None
-
-    @property
-    def latest(self) -> Snapshot | None:
-        return self._latest
+        self._latest: dict[int, Snapshot] = {}
 
     def set(self, snap: Snapshot) -> None:
-        self._latest = snap
+        self._latest[snap.node_id] = snap
+
+    def get(self, node_id: int) -> Snapshot | None:
+        return self._latest.get(node_id)
+
+    def known_node_ids(self) -> list[int]:
+        return sorted(self._latest.keys())
+
+    def wallet_for(self, node_id: int) -> str | None:
+        s = self._latest.get(node_id)
+        return s.node_wallet if s else None
 
 
 store = Store()

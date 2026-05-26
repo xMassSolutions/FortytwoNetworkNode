@@ -49,9 +49,11 @@ a { color: var(--blue); text-decoration: none; }
 <body>
 <div class="container">
   <header>
-    <h1>FortyTwo Network: Node Analysis</h1>
+    <h1 id="h1-title">FortyTwo Network: Node Analysis</h1>
     <div class="meta" id="meta">Loading…</div>
   </header>
+  <!-- Node tab strip — populated by JS from /v1/dashboard-data.known_nodes -->
+  <div class="toggle-group" id="node-tabs" style="margin-bottom:16px"></div>
   <div class="grid">
     <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
     <div class="card">
@@ -134,6 +136,12 @@ a { color: var(--blue); text-decoration: none; }
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script>
+// Per-node dashboard: read the node id from the URL path's trailing segment.
+// /dashboard/1 → 1, /dashboard/2 → 2, /dashboard (legacy) is server-redirected
+// to /dashboard/1 so we never see it here in practice.
+const NODE_ID = parseInt(location.pathname.split('/').filter(Boolean).pop()) || 1;
+document.title = 'FortyTwo Network: Node ' + NODE_ID;
+(function(){ const h = document.getElementById('h1-title'); if (h) h.textContent = 'FortyTwo Network: Node ' + NODE_ID; })();
 let chart;
 let chartMode = 'hourly';
 let logMode = 'extended';
@@ -330,13 +338,23 @@ function renderNodeCard(s){
 
 async function refresh(){
   let data;
-  try { const r = await fetch('/v1/dashboard-data',{cache:'no-store'}); data = await r.json(); }
+  try { const r = await fetch('/v1/dashboard-data?node='+NODE_ID,{cache:'no-store'}); data = await r.json(); }
   catch(e){ document.getElementById('meta').textContent='fetch error: '+e.message; return; }
 
   const s = data.snapshot;
   lastSnapshot = s;
   lastChainRewards = data.chain_rewards || null;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
+
+  // Tab strip — re-rendered every refresh so a brand-new node appearing in
+  // known_nodes shows up without a page reload. Full <a> navigation between
+  // tabs (no SPA routing) keeps each page's state clean.
+  const tabsEl = document.getElementById('node-tabs');
+  if (tabsEl) {
+    tabsEl.innerHTML = (data.known_nodes || [1]).map(id =>
+      `<a class="toggle-btn ${id===NODE_ID?'active':''}" href="/dashboard/${id}" style="text-decoration:none">Node ${id}</a>`
+    ).join('');
+  }
 
   // Staleness threshold: heartbeat is 60s; flag anything older than 3 min
   // (3 missed heartbeats) as STALE to leave room for jitter / network blips

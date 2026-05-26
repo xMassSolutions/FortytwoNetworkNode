@@ -69,6 +69,9 @@ class _Transfer:
 
 @dataclass
 class RewardsTracker:
+    # Lowercased operator wallet this tracker is scanning. One tracker per
+    # wallet — see `get_tracker()` at module bottom. Required field.
+    wallet: str = ""
     today_utc_date: str | None = None
     today_midnight_ts: int | None = None
     today_midnight_block: int | None = None
@@ -95,7 +98,7 @@ class RewardsTracker:
         if self._historical_loaded:
             return
         try:
-            for row in load_daily_totals():
+            for row in load_daily_totals(self.wallet):
                 for k, v in (row.get("by_hour") or {}).items():
                     try:
                         self.historical_by_hour[k] = float(v)
@@ -117,6 +120,7 @@ class RewardsTracker:
         try:
             upsert_daily_total(
                 self.today_utc_date,
+                self.wallet,
                 {k: round(v, 6) for k, v in by_hour.items()},
                 round(sum(t.amount for t in self.today_transfers), 6),
                 len(self.today_transfers),
@@ -185,7 +189,7 @@ class RewardsTracker:
         return low
 
     async def _fetch_chunk_with_halving(
-        self, rpc_url: str, for_contract: str, wallet: str,
+        self, rpc_url: str, for_contract: str,
         cursor: int, chunk_end: int,
     ) -> tuple[list[dict], int, str | None]:
         """Try eth_getLogs over [cursor, chunk_end]. On 413 or timeout, halve
@@ -197,7 +201,7 @@ class RewardsTracker:
         while attempt_end >= cursor:
             try:
                 events = await get_transfer_events(
-                    rpc_url, for_contract, [wallet], cursor, attempt_end
+                    rpc_url, for_contract, [self.wallet], cursor, attempt_end
                 )
                 return events, attempt_end, None
             except Exception as e:
@@ -213,7 +217,7 @@ class RewardsTracker:
                 attempt_end = cursor + (span // 2) - 1
         return [], cursor - 1, last_err
 
-    async def refresh(self, rpc_url: str, for_contract: str, wallet: str) -> None:
+    async def refresh(self, rpc_url: str, for_contract: str) -> None:
         now = time.time()
         today = _utc_today_str()
 
@@ -249,7 +253,7 @@ class RewardsTracker:
             while cursor <= latest:
                 chunk_end = min(cursor + _CHUNK_SIZE - 1, latest)
                 events, advanced_to, err = await self._fetch_chunk_with_halving(
-                    rpc_url, for_contract, wallet, cursor, chunk_end,
+                    rpc_url, for_contract, cursor, chunk_end,
                 )
                 if err and not events:
                     chunk_err = err
@@ -484,4 +488,16 @@ class RewardsTracker:
         }
 
 
-tracker = RewardsTracker()
+_trackers: dict[str, RewardsTracker] = {}
+
+
+def get_tracker(wallet: str) -> RewardsTracker:
+    """Return (creating if needed) the tracker for the given operator wallet."""
+    wlc = wallet.lower()
+    if wlc not in _trackers:
+        _trackers[wlc] = RewardsTracker(wallet=wlc)
+    return _trackers[wlc]
+
+
+def known_tracker_wallets() -> list[str]:
+    return list(_trackers.keys())

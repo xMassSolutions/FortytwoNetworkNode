@@ -236,9 +236,26 @@ Caveats in Docker mode:
 - GPU info still comes from host `nvidia-smi`. Works if the container uses `--gpus all` — `nvidia-smi` on the host sees all GPU activity (host + containers).
 - `capsule_alive` is determined by HTTP ready probe (same as native), so it's accurate as long as the ready port is mapped.
 
+#### Running multiple nodes against one dashboard
+
+Each node gets its own page on the dashboard (`/dashboard/1`, `/dashboard/2`, …) with a tab strip across the top for clicking between them. Both agents push to the same `BotUrl` with the same `AgentToken` — node identity comes from `-NodeId`, and each node sends its own operator wallet via `-NodeWallet`.
+
+**Windows (second node):**
+
+```powershell
+.\install-as-task.ps1 `
+    -BotUrl "https://<service>.onrender.com" `
+    -AgentToken "<your-agent-token>" `
+    -ScriptsRoot "C:\path\to\fortytwo-p2p-inference-scripts-main" `
+    -NodeId 2 `
+    -NodeWallet "0x<node-2-operator-wallet>"
+```
+
+The scheduled task is named per-node (`FortytwoBotAgent-Node<N>`) so you can install two on the same Windows box if you really want to. Existing single-node installs keep working unchanged — re-run the installer with `-NodeId 1 -NodeWallet 0x…` to upgrade node 1 into the multi-node setup (otherwise it falls back to the bot's `WALLET` env var).
+
 ### 3. Open the dashboard
 
-`https://<service>.onrender.com/dashboard` — works on any browser. Bookmark or Add to Home Screen on your phone for an app-like icon.
+`https://<service>.onrender.com/dashboard` — works on any browser. Bookmark or Add to Home Screen on your phone for an app-like icon. (Multi-node setups: `/dashboard/1` and `/dashboard/2` — root URL redirects to `/dashboard/1`.)
 
 ---
 
