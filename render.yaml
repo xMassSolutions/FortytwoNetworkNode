@@ -22,3 +22,16 @@ services:
       # falls back to SQLite at /tmp -- ephemeral on the free tier.
       - key: DATABASE_URL
         sync: false
+      # Optional dashboard auth -- when both DASHBOARD_USER and
+      # DASHBOARD_PASS_HASH are set, the dashboard requires a login.
+      # DASHBOARD_PASS_HASH is a bcrypt hash; generate locally with
+      #   python3 -c "import bcrypt,getpass; \
+      #     print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt()).decode())"
+      - key: DASHBOARD_USER
+        sync: false
+      - key: DASHBOARD_PASS_HASH
+        sync: false
+      # Optional. Long random string used to sign session cookies. If
+      # unset, regenerated each boot (logs everyone out on redeploy).
+      - key: SESSION_SECRET
+        sync: false

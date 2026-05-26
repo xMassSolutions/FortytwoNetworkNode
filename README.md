@@ -96,6 +96,31 @@ Render's free tier wipes `/tmp` (where the bot's default SQLite lives) on every 
 
 The bot creates its tables on first boot. No manual schema setup needed.
 
+##### Lock down the dashboard (optional)
+
+By default the dashboard is open — anyone with the URL can see your node telemetry. Set two env vars on Render to gate it behind a username/password. The **plaintext password never lives on the server**; you store a bcrypt hash and type the real password into a login form.
+
+1. Generate the hash on your local machine (Python 3.6+):
+
+   ```bash
+   python3 -c "import bcrypt, getpass; \
+     print(bcrypt.hashpw(getpass.getpass('password: ').encode(), bcrypt.gensalt()).decode())"
+   ```
+
+   It'll prompt for a password (typed input hidden), print a `$2b$…` hash. Copy the hash; remember the password (paste into 1Password / your manager).
+
+2. In your Render service's env vars set:
+
+   | Var | What |
+   |---|---|
+   | `DASHBOARD_USER` | The username you'll use to log in (e.g. `admin`) |
+   | `DASHBOARD_PASS_HASH` | The `$2b$…` hash from step 1 |
+   | `SESSION_SECRET` | Any long random string (e.g. `openssl rand -hex 32`). Optional — without it sessions invalidate on every redeploy. |
+
+3. Redeploy. Visit `/dashboard/1` and you'll be bounced to a login page. After login you stay signed in for 7 days; click **logout** in the dashboard header to end the session.
+
+To turn auth back off: clear `DASHBOARD_USER` and `DASHBOARD_PASS_HASH` from Render env vars and redeploy. The bot logs `WARN: dashboard auth DISABLED …` on every boot when it's running unprotected.
+
 #### Railway (alternative)
 
 1. Fork this repo.

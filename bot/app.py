@@ -2,17 +2,21 @@ import asyncio
 import logging
 import os
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+import bcrypt
+from fastapi import Cookie, Depends, FastAPI, Form, Header, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 from pydantic import BaseModel, Field, field_validator
 
 import wallets as wstore
 from chain import get_for_balance, get_native_balance
 from dashboard_html import DASHBOARD_HTML
 from db import init_schema, load_rounds_history, upsert_rounds_history
+from login_html import LOGIN_HTML
 from rewards import get_tracker
 from store import Snapshot, store
 
@@ -28,6 +32,28 @@ AGENT_TOKEN = os.environ["AGENT_TOKEN"]
 WALLET = os.environ["WALLET"]
 FOR_CONTRACT = os.environ.get("FOR_CONTRACT", "0xf6B888f442277F01294F94D555608A2E8Bc86430")
 MONAD_RPC_URL = os.environ.get("MONAD_RPC_URL", "https://testnet-rpc.monad.xyz/")
+
+# --- Dashboard login -------------------------------------------------------
+# Opt-in: when both DASHBOARD_USER and DASHBOARD_PASS_HASH are set, the
+# dashboard pages and /v1/dashboard-data require a signed session cookie.
+# The plaintext password is NEVER stored server-side -- only the bcrypt
+# hash lives in env. Generate the hash locally with:
+#   python3 -c "import bcrypt,getpass; \
+#     print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt()).decode())"
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "").strip()
+DASHBOARD_PASS_HASH = os.environ.get("DASHBOARD_PASS_HASH", "").strip()
+AUTH_ENABLED = bool(DASHBOARD_USER and DASHBOARD_PASS_HASH)
+
+# Session cookies are HMAC-signed with this key. Setting it explicitly in
+# Render lets sessions survive a redeploy; if unset we generate a fresh
+# random key per boot so the cookies stay tamper-proof but invalidate
+# every restart.
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "").strip() or secrets.token_hex(32)
+_SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
+_SIGNER = TimestampSigner(SESSION_SECRET)
+# Whether to mark cookies Secure. False for plain-http local dev; defaults
+# True since production is HTTPS-only on Render.
+_COOKIE_SECURE = os.environ.get("COOKIE_INSECURE", "").lower() not in ("1", "true", "yes")
 
 # Balance caches — at 5s dashboard refresh × N viewers, hitting Monad RPC every
 # request gets us rate-limited. Cache per wallet for 30s. Keyed by lowercased
@@ -111,6 +137,48 @@ def _merge_rounds_history(node_id: int, live: dict[str, int] | None) -> dict[str
     return merged
 
 
+def _verify_session_cookie(token: str | None) -> bool:
+    """Return True iff `token` is a signed-by-us cookie whose payload equals
+    the configured DASHBOARD_USER and whose timestamp is within
+    _SESSION_MAX_AGE. False on tamper, expiry, or any decode error."""
+    if not token:
+        return False
+    try:
+        payload = _SIGNER.unsign(token, max_age=_SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return False
+    return payload.decode() == DASHBOARD_USER
+
+
+def require_login(session: str | None = Cookie(default=None)) -> None:
+    """FastAPI dependency for HTML routes: 303 to /login when not authed."""
+    if not AUTH_ENABLED:
+        return
+    if not _verify_session_cookie(session):
+        raise HTTPException(status_code=303, headers={"Location": "/login"})
+
+
+def require_login_json(session: str | None = Cookie(default=None)) -> None:
+    """Same as require_login but 401 (no redirect) -- right for JSON
+    endpoints so the dashboard SPA can detect it and navigate itself."""
+    if not AUTH_ENABLED:
+        return
+    if not _verify_session_cookie(session):
+        raise HTTPException(status_code=401, detail="not logged in")
+
+
+def _issue_session_cookie(resp: Response) -> None:
+    token = _SIGNER.sign(DASHBOARD_USER.encode()).decode()
+    resp.set_cookie(
+        "session", token,
+        max_age=_SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=_COOKIE_SECURE,
+        path="/",
+    )
+
+
 def _active_wallets() -> set[str]:
     wallets: set[str] = set()
     for nid in store.known_node_ids():
@@ -138,6 +206,14 @@ async def _background_rewards_refresher() -> None:
 async def lifespan(_app: FastAPI):
     init_schema()
     log.info("SQLite schema initialised")
+    if AUTH_ENABLED:
+        log.info("dashboard auth ENABLED (user=%s)", DASHBOARD_USER)
+    else:
+        log.warning("dashboard auth DISABLED -- set DASHBOARD_USER and "
+                    "DASHBOARD_PASS_HASH to lock down the dashboard")
+    if not os.environ.get("SESSION_SECRET", "").strip():
+        log.warning("SESSION_SECRET unset -- sessions invalidate on every "
+                    "restart (set it in Render to make sessions sticky)")
     refresher = asyncio.create_task(_background_rewards_refresher())
     try:
         yield
@@ -260,12 +336,50 @@ async def dashboard_legacy():
 
 
 @app.get("/dashboard/{node_id}", response_class=HTMLResponse, include_in_schema=False)
-async def dashboard_node(node_id: int):
+async def dashboard_node(node_id: int, _: None = Depends(require_login)):
     if node_id < 1:
         raise HTTPException(status_code=404, detail="not found")
     # All node pages render the same HTML; the SPA reads node_id from the URL
     # and asks /v1/dashboard-data?node=N for the right snapshot.
     return HTMLResponse(content=DASHBOARD_HTML)
+
+
+@app.get("/login", include_in_schema=False)
+async def login_form(session: str | None = Cookie(default=None)):
+    # Already signed in -> straight to the dashboard.
+    if AUTH_ENABLED and _verify_session_cookie(session):
+        return RedirectResponse(url="/dashboard/1", status_code=303)
+    # Auth disabled -> there's nothing to log in to; skip the form.
+    if not AUTH_ENABLED:
+        return RedirectResponse(url="/dashboard/1", status_code=303)
+    return HTMLResponse(content=LOGIN_HTML)
+
+
+@app.post("/login", include_in_schema=False)
+async def login_submit(username: str = Form(...), password: str = Form(...)):
+    # Always run bcrypt so the response time is the same whether the username
+    # was wrong, the password was wrong, or auth is disabled -- avoids a
+    # timing oracle for "is this a real username?".
+    expected_hash = (DASHBOARD_PASS_HASH or "").encode()
+    try:
+        pw_ok = bcrypt.checkpw(password.encode(), expected_hash) if expected_hash else False
+    except ValueError:
+        # Malformed hash in env -- treat as wrong password. Logged at boot
+        # already if invalid; no point spamming here.
+        pw_ok = False
+    user_ok = AUTH_ENABLED and username == DASHBOARD_USER
+    if user_ok and pw_ok:
+        resp = RedirectResponse(url="/dashboard/1", status_code=303)
+        _issue_session_cookie(resp)
+        return resp
+    return RedirectResponse(url="/login?error=1", status_code=303)
+
+
+@app.post("/logout", include_in_schema=False)
+async def logout():
+    resp = RedirectResponse(url="/login", status_code=303)
+    resp.delete_cookie("session", path="/")
+    return resp
 
 
 class AddWalletPayload(BaseModel):
@@ -274,7 +388,7 @@ class AddWalletPayload(BaseModel):
 
 
 @app.post("/v1/wallets")
-async def add_wallet(payload: AddWalletPayload):
+async def add_wallet(payload: AddWalletPayload, _: None = Depends(require_login_json)):
     try:
         addr = wstore.add_watched(payload.address, payload.label)
     except ValueError as e:
@@ -283,7 +397,7 @@ async def add_wallet(payload: AddWalletPayload):
 
 
 @app.get("/v1/wallets")
-async def list_wallets():
+async def list_wallets(_: None = Depends(require_login_json)):
     rows = wstore.list_watched()
     enriched: list[dict] = []
     for w in rows:
@@ -310,7 +424,7 @@ async def list_wallets():
 
 
 @app.get("/v1/dashboard-data")
-async def dashboard_data(node: int = 1):
+async def dashboard_data(node: int = 1, _: None = Depends(require_login_json)):
     s = store.get(node)
     # Resolve operator wallet for this node:
     #   - node has snapshot with explicit node_wallet → use that
@@ -410,4 +524,6 @@ async def dashboard_data(node: int = 1):
         "wallet": wallet,
         "wallet_short": (f"{wallet[:6]}…{wallet[-4:]}" if wallet else None),
         "known_nodes": known_nodes,
+        # SPA uses this to decide whether to render the logout button.
+        "auth_enabled": AUTH_ENABLED,
     })

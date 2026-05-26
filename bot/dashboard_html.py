@@ -48,9 +48,16 @@ a { color: var(--blue); text-decoration: none; }
 </head>
 <body>
 <div class="container">
-  <header>
-    <h1 id="h1-title">FortyTwo Network: Node Analysis</h1>
-    <div class="meta" id="meta">Loading…</div>
+  <header style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap">
+    <div>
+      <h1 id="h1-title">FortyTwo Network: Node Analysis</h1>
+      <div class="meta" id="meta">Loading…</div>
+    </div>
+    <!-- Logout button. Hidden via JS when /v1/dashboard-data tells us auth
+         is disabled (set CSS hidden until first refresh resolves it). -->
+    <form id="logout-form" method="post" action="/logout" style="display:none">
+      <button class="toggle-btn" type="submit">logout</button>
+    </form>
   </header>
   <!-- Node tab strip — populated by JS from /v1/dashboard-data.known_nodes -->
   <div class="toggle-group" id="node-tabs" style="margin-bottom:16px"></div>
@@ -338,13 +345,27 @@ function renderNodeCard(s){
 
 async function refresh(){
   let data;
-  try { const r = await fetch('/v1/dashboard-data?node='+NODE_ID,{cache:'no-store'}); data = await r.json(); }
+  try {
+    const r = await fetch('/v1/dashboard-data?node='+NODE_ID,{cache:'no-store'});
+    // Session expired (or never existed) -- bounce to login. Full navigation
+    // because the page might be stale and we want a fresh render after auth.
+    if (r.status === 401) { location.href = '/login'; return; }
+    data = await r.json();
+  }
   catch(e){ document.getElementById('meta').textContent='fetch error: '+e.message; return; }
 
   const s = data.snapshot;
   lastSnapshot = s;
   lastChainRewards = data.chain_rewards || null;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
+
+  // Reveal the logout button only when the server says auth is enabled.
+  // When auth is disabled (local dev, unconfigured deploy) the form stays
+  // display:none -- nothing to log out of.
+  const logoutForm = document.getElementById('logout-form');
+  if (logoutForm) {
+    logoutForm.style.display = data.auth_enabled ? 'inline' : 'none';
+  }
 
   // Tab strip — re-rendered every refresh so a brand-new node appearing in
   // known_nodes shows up without a page reload. Full <a> navigation between
