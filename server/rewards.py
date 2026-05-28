@@ -366,8 +366,9 @@ class RewardsTracker:
         # Without this, the matcher would re-attach the same tx to a second
         # round that happens to have an overlapping interval window.
         already_claimed: set[str] = {r["tx_hash"] for r in rounds if r.get("tx_hash")}
-        avail: list[tuple[int, str]] = sorted(
-            [(t.ts, t.tx_hash) for t in self.today_transfers if t.tx_hash not in already_claimed],
+        avail: list[tuple[int, str, float]] = sorted(
+            [(t.ts, t.tx_hash, t.amount) for t in self.today_transfers
+             if t.tx_hash not in already_claimed],
             key=lambda x: x[0],
         )
         used: set[int] = set()
@@ -396,7 +397,7 @@ class RewardsTracker:
             range(len(rounds)),
             key=lambda i: (_round_interval(rounds[i]) is None, _completed(i)),
         )
-        matches: dict[int, str] = {}
+        matches: dict[int, tuple[str, float]] = {}
 
         def _do_pass(pad: int) -> None:
             """Run one greedy pass: each unmatched participation claims the
@@ -420,7 +421,7 @@ class RewardsTracker:
                 hi = completed_ts + pad
                 best_ai = None
                 best_delta = float("inf")
-                for ai, (ts, _tx) in enumerate(avail):
+                for ai, (ts, _tx, _amt) in enumerate(avail):
                     if ai in used:
                         continue
                     if ts < lo or ts > hi:
@@ -431,7 +432,7 @@ class RewardsTracker:
                         best_ai = ai
                 if best_ai is not None:
                     used.add(best_ai)
-                    matches[orig_i] = avail[best_ai][1]
+                    matches[orig_i] = (avail[best_ai][1], avail[best_ai][2])
 
         # Pass 1: strict window.
         _do_pass(pad_seconds)
@@ -439,12 +440,16 @@ class RewardsTracker:
         # resolution and overlapping-window losers without going wild.
         _do_pass(pad_seconds * 6)
 
-        # Rebuild in original order with matched tx_hashes injected.
+        # Rebuild in original order with matched tx_hash + reward_amount
+        # injected. reward_amount lets persisters (the rounds table) capture
+        # the per-round payout without re-running the matcher themselves.
         out: list[dict[str, Any]] = []
         for i, r in enumerate(rounds):
             if i in matches:
+                tx, amt = matches[i]
                 r2 = dict(r)
-                r2["tx_hash"] = matches[i]
+                r2["tx_hash"] = tx
+                r2["reward_amount"] = amt
                 out.append(r2)
             else:
                 out.append(r)
@@ -501,3 +506,86 @@ def get_tracker(wallet: str) -> RewardsTracker:
 
 def known_tracker_wallets() -> list[str]:
     return list(_trackers.keys())
+
+
+# --- Earnings projection --------------------------------------------------
+# Below the threshold, today's pace is too noisy to extrapolate (one early
+# reward in hour 0 would project to 24x weekly). Card falls back to the
+# 7-day average alone until we're this far into UTC day.
+_PROJECTION_MIN_HOURS_ELAPSED = 1.0
+
+
+def projections(wallet: str) -> dict[str, Any]:
+    """Card-ready earnings projection for the operator wallet.
+
+    Combines two signals:
+      - "Today's pace": earned_today extrapolated from elapsed UTC hours.
+        Suppressed before _PROJECTION_MIN_HOURS_ELAPSED to dodge noise.
+      - "7-day average": mean of the last 7 *complete* UTC days from
+        daily_totals (today excluded — it's a partial day).
+
+    Both are returned; the dashboard decides which to surface and how.
+    Numbers are returned raw (not rounded) so the client picks the right
+    precision per slot."""
+    tracker = get_tracker(wallet)
+    s = tracker.summary()
+    earned_today = float(s.get("earned_today") or 0.0)
+
+    now = datetime.now(timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    hours_elapsed = max(0.0, (now - midnight).total_seconds() / 3600.0)
+
+    today_pace_per_hour: float | None = None
+    today_projected_daily: float | None = None
+    today_projected_weekly: float | None = None
+    today_projected_monthly: float | None = None
+    if hours_elapsed >= _PROJECTION_MIN_HOURS_ELAPSED:
+        today_pace_per_hour = earned_today / hours_elapsed
+        today_projected_daily = today_pace_per_hour * 24.0
+        today_projected_weekly = today_projected_daily * 7.0
+        today_projected_monthly = today_projected_daily * 30.0
+
+    # 7-day average from persisted daily_totals. We deliberately skip today
+    # so the average reflects complete days only. Rows are already ordered
+    # by utc_date ascending.
+    days_used = 0
+    sum_7d = 0.0
+    try:
+        rows = load_daily_totals(wallet)
+    except Exception:
+        rows = []
+    for row in reversed(rows):
+        if row.get("utc_date") == today_str:
+            continue
+        amount = row.get("total_amount")
+        if amount is None:
+            continue
+        try:
+            sum_7d += float(amount)
+        except (TypeError, ValueError):
+            continue
+        days_used += 1
+        if days_used >= 7:
+            break
+
+    avg_7d_daily: float | None = None
+    avg_7d_weekly: float | None = None
+    avg_7d_monthly: float | None = None
+    if days_used > 0:
+        avg_7d_daily = sum_7d / days_used
+        avg_7d_weekly = avg_7d_daily * 7.0
+        avg_7d_monthly = avg_7d_daily * 30.0
+
+    return {
+        "earned_today": earned_today,
+        "hours_elapsed": round(hours_elapsed, 2),
+        "today_pace_per_hour": today_pace_per_hour,
+        "today_projected_daily": today_projected_daily,
+        "today_projected_weekly": today_projected_weekly,
+        "today_projected_monthly": today_projected_monthly,
+        "avg_7d_daily": avg_7d_daily,
+        "avg_7d_weekly": avg_7d_weekly,
+        "avg_7d_monthly": avg_7d_monthly,
+        "days_used_for_avg": days_used,
+    }

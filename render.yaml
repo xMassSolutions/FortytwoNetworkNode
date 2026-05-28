@@ -2,7 +2,7 @@ services:
   - type: web
     name: fortytwo-network-node-analysis
     runtime: docker
-    rootDir: bot
+    rootDir: server
     dockerfilePath: ./Dockerfile
     region: virginia
     plan: free

@@ -4,12 +4,14 @@ Self-hostable dashboard + workstation agent for monitoring one or more [FortyTwo
 
 ## What you get
 
-- **One or many nodes, one dashboard.** Each node gets its own page at `/dashboard/<id>`; flip between them with the tab strip across the top. Per-node operator wallets — balances and reward histories stay isolated.
+- **One or many nodes, one dashboard.** `/dashboard` shows an aggregate page — one tile per node with today's FOR + TPS + uptime + last-seen — plus combined totals. Click a tile to drill into the per-node view at `/dashboard/<id>`. Per-node operator wallets, balances and reward histories stay isolated.
 - **Durable reward history.** Point the bot at a free [Neon](https://neon.tech) Postgres and today's per-hour FOR earnings + the rolling rounds-participated chart survive every Render cold start and redeploy. Without it, the bot still runs on ephemeral SQLite — just forgets yesterday.
 - **Optional login wall.** Username/password in front of every dashboard page and JSON endpoint. Plaintext password never lives on the server — you generate a bcrypt hash locally and paste only the hash into Render. Sessions stick for 7 days; one click to log out.
 - **Live node telemetry.** FOR + MONAD balance, today's on-chain earnings, last reward, model + size, GPU + VRAM, TPS / symbols/sec, Capsule + Protocol versions + uptime, first / last round times — auto-refreshed every 5 s.
+- **Heartbeat uptime.** Per-node 24h / 7d uptime percentages on the dashboard, rolled up from one-per-minute samples persisted to Postgres (or SQLite). "Alive" = an agent push landed in the last 90 s.
+- **Per-round history.** Every inference round (hash, tx hash, completion time, duration, reward) persists to a `rounds` table. Query via `GET /v1/rounds?node=N&since=YYYY-MM-DDTHH:MM:SSZ&limit=N` for ad-hoc reporting ("best-paying round ever", "every round on Tuesday").
 - **On-chain truth for rewards.** "FOR earned today" is computed by scanning ERC-20 Transfer events on Monad Testnet directly — not derived from the Capsule log. Recent rounds get their tx hash linked to monadscan automatically; the chain matcher fixes up rounds the log forgot.
-- **Auto-updating workstation agent.** Self-pulls from `origin/main` every 30 min and restarts on the new code. Surfaces the running git SHA on the dashboard so you can confirm an update landed.
+- **Auto-updating workstation agent.** Self-pulls from `origin/main` every 5 min and restarts on the new code. Surfaces the running git SHA on the dashboard so you can confirm an update landed.
 - **Multi-wallet watch.** Add any Monad Testnet address to track its FOR + MONAD balance alongside your operator wallet.
 - **Free-tier friendly.** Designed to run on Render free + Neon free + your own workstation. No paid services required.
 
@@ -19,7 +21,7 @@ Responsive layout, Add-to-Home-Screen friendly.
 
 | Layer | Options |
 |---|---|
-| **Bot host** | Render · Railway · any Docker host (`bot/Dockerfile`) |
+| **Server host** | Render · Railway · any Docker host (`server/Dockerfile`) |
 | **Postgres** | Neon · Supabase · any standard Postgres URL — optional, SQLite fallback works |
 | **Agent OS** | Windows (Scheduled Task) · macOS (launchd) · Linux (systemd) |
 | **Node runtime** | Native (`pgrep` / `Get-Process`) · Docker (`docker top` / `docker inspect`) |
@@ -35,7 +37,7 @@ If you have a coding agent with tool use (Claude, ChatGPT-with-tools, etc.), pas
 > `https://github.com/<your-fork>/FortytwoNetworkNode` for me.
 >
 > 1. Fork the repo to my GitHub account if I haven't already.
-> 2. Deploy the `bot/` service to my Render account using the blueprint at
+> 2. Deploy the `server/` service to my Render account using the blueprint at
 >    `render.yaml`. Prompt me for `WALLET` (my Monad Testnet operator wallet)
 >    and generate a random 40-char `AGENT_TOKEN`.
 > 3. Set up free [Neon](https://neon.tech) Postgres so reward history
@@ -102,7 +104,7 @@ openssl rand -hex 20
 1. Fork this repo.
 2. Sign up at <https://railway.app>.
 3. **New Project** → **Deploy from GitHub repo** → pick your fork.
-4. In the service's **Settings**, set **Root Directory** to `bot`. Railpack scans the repo root by default and can't find the Dockerfile (it lives in `bot/`). The `railway.json` at repo root configures the rest (Dockerfile path, healthcheck, restart policy).
+4. In the service's **Settings**, set **Root Directory** to `server`. Railpack scans the repo root by default and can't find the Dockerfile (it lives in `server/`). The `railway.json` at repo root configures the rest (Dockerfile path, healthcheck, restart policy).
 5. **Variables** → add the same env vars from the Render table above.
 6. Deploy. First build is 3–5 min.
 7. Verify: open `https://<your-app>.up.railway.app/healthz` → `{"ok":true}`.
@@ -219,6 +221,8 @@ By default the dashboard is public to anyone with the URL. Set three env vars to
 
 3. Redeploy. Visit `/dashboard/1` and you'll be bounced to the login page. 7-day session; **logout** button in the dashboard header.
 
+**Brute-force protection.** `/login` is rate-limited per client IP — 5 failed attempts in 15 min triggers a 429 with `Retry-After`. Tune with `LOGIN_RATE_LIMIT_MAX` and `LOGIN_RATE_LIMIT_WINDOW_SECS` if needed. Successful logins reset the counter.
+
 To turn auth off: clear `DASHBOARD_USER` and `DASHBOARD_PASS_HASH` and redeploy. The bot logs `WARN: dashboard auth DISABLED …` on every boot while running unprotected.
 
 ### Running multiple nodes against one dashboard
@@ -246,7 +250,7 @@ Day-to-day operations on the workstation. The bot side (Render) auto-deploys on 
 
 ### Update (pull latest + restart)
 
-Auto-updater handles this every 30 min. Use this for an immediate update:
+Auto-updater handles this every 5 min. Use this for an immediate update:
 
 ```powershell
 # Windows
@@ -271,11 +275,11 @@ cd ~/FortytwoNetworkNode && ./agent/update-agent.sh
 | Status | `Get-ScheduledTaskInfo <TASK>` | `launchctl list \| grep com.fortytwo.agent` | `systemctl --user status fortytwo-agent` |
 | Live log | `Get-Content $env:USERPROFILE\FortytwoNetworkNode\agent\agent.log -Tail 20 -Wait` | `tail -f ~/Library/Logs/fortytwo-agent.log` | `tail -f ~/.cache/fortytwo-agent.log` |
 
-You should see a `push ok:` line every heartbeat (~60 s) plus one per inference event, and `auto-update:` lines every 30 min.
+You should see a `push ok:` line every heartbeat (~60 s) plus one per inference event, and `auto-update:` lines every 5 min.
 
 ### Auto-update
 
-Every **30 min** the agent runs `git ls-remote origin main`; if it differs from local, `git pull --ff-only` and exit so the Scheduled Task / launchd / systemd respawns on the new code.
+Every **5 min** the agent runs `git ls-remote origin main`; if it differs from local, `git pull --ff-only` and exit so the Scheduled Task / launchd / systemd respawns on the new code.
 
 Change cadence: set `FORTYTWO_AUTOUPDATE_MINUTES=N` (integer minutes; `0` disables). Per-install disable: re-run installer with `-NoAutoUpdate` (Windows) or append `--no-auto-update` to the plist/unit `ExecStart` (Mac/Linux).
 
@@ -295,6 +299,12 @@ Change cadence: set `FORTYTWO_AUTOUPDATE_MINUTES=N` (integer minutes; `0` disabl
 | `DASHBOARD_USER` | optional | — | Set with `DASHBOARD_PASS_HASH` to require login. |
 | `DASHBOARD_PASS_HASH` | optional | — | bcrypt hash from the one-liner in [Dashboard auth](#dashboard-auth-optional). |
 | `SESSION_SECRET` | optional | random per boot | HMAC key for session cookies. Set it to make sessions survive redeploys. |
+| `LOGIN_RATE_LIMIT_MAX` | no | `5` | Max failed `/login` attempts per IP per window before 429. `0` disables. |
+| `LOGIN_RATE_LIMIT_WINDOW_SECS` | no | `900` | Sliding-window length for the failure counter (default 15 min). |
+| `UPTIME_STALE_AFTER_SECS` | no | `90` | A sample is "alive" if the agent pushed within this many seconds. |
+| `UPTIME_SAMPLE_INTERVAL_SECS` | no | `60` | Background sampler tick; `0` disables uptime tracking. |
+| `UPTIME_RETENTION_DAYS` | no | `7` | Older `uptime_samples` rows are pruned on the hourly sweep. |
+| `ROUNDS_QUERY_MAX` | no | `1000` | Hard cap on `/v1/rounds?limit=…` to keep payloads bounded. |
 | `FOR_CONTRACT` | no | `0xf6B888…6430` | FOR token on Monad Testnet — leave default. |
 | `MONAD_RPC_URL` | no | `https://testnet-rpc.monad.xyz/` | Override if rate-limited. |
 
@@ -326,10 +336,10 @@ Change cadence: set `FORTYTWO_AUTOUPDATE_MINUTES=N` (integer minutes; `0` disabl
 
 ## Architecture
 
-- **Bot** (`bot/`) — Python FastAPI service. Receives agent pushes at `POST /v1/status`, serves the dashboard at `GET /dashboard/<id>`, scans Monad Testnet for FOR Transfer events to compute today's authoritative reward total. Persists daily reward totals + per-hour rounds history to Postgres (or SQLite fallback); in-memory snapshot store for the latest live data per node.
+- **Server** (`server/`) — Python FastAPI service. Receives agent pushes at `POST /v1/status`, serves the dashboard at `GET /dashboard/<id>`, scans Monad Testnet for FOR Transfer events to compute today's authoritative reward total. Persists daily reward totals + per-hour rounds history to Postgres (or SQLite fallback); in-memory snapshot store for the latest live data per node.
 - **Agent** (`agent/`) — workstation-resident script. Polls the Capsule log for new inference events on a 5 s tick, pushes a snapshot to the bot on each event plus a regular heartbeat. Maintains a rolling 30-day per-hour rounds buffer locally (`agent/rounds-history.json`); the bot mirrors this into Postgres on every push so it survives a workstation reinstall.
-- **Dashboard** (`bot/dashboard_html.py`) — single-file HTML+JS, no build step. Reads `node_id` from the URL path, fetches `/v1/dashboard-data?node=<id>` every 5 s, renders the tab strip / cards / chart from one JSON response. Chart.js for the rounds bar chart.
-- **Auth** (`bot/login_html.py` + login routes in `app.py`) — optional. Form-based login, signed session cookie via `itsdangerous`, bcrypt verification. Disabled when env vars are unset.
+- **Dashboard** (`server/dashboard_html.py`) — single-file HTML+JS, no build step. Reads `node_id` from the URL path, fetches `/v1/dashboard-data?node=<id>` every 5 s, renders the tab strip / cards / chart from one JSON response. Chart.js for the rounds bar chart.
+- **Auth** (`server/login_html.py` + login routes in `app.py`) — optional. Form-based login, signed session cookie via `itsdangerous`, bcrypt verification. Disabled when env vars are unset.
 
 ---
 

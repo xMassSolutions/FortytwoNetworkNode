@@ -144,6 +144,36 @@ CREATE TABLE IF NOT EXISTS rounds_history (
 )
 """
 
+# alive is 0/1 (SQLite has no native BOOL; Postgres accepts INTEGER fine).
+# One row per node per minute via the background sampler in app.py.
+_DDL_UPTIME_SAMPLES = """
+CREATE TABLE IF NOT EXISTS uptime_samples (
+    node_id INTEGER NOT NULL,
+    ts      DOUBLE PRECISION NOT NULL,
+    alive   INTEGER NOT NULL,
+    PRIMARY KEY (node_id, ts)
+)
+"""
+
+# Per-round history. PK (node_id, hash) -- round hashes are unique per
+# inference request and don't repeat across days. Upsert path uses
+# COALESCE so a later push with chain-matched tx_hash/reward_amount can
+# fill in fields that an earlier push left NULL, without clobbering them
+# back to NULL.
+_DDL_ROUNDS = """
+CREATE TABLE IF NOT EXISTS rounds (
+    node_id        INTEGER NOT NULL,
+    hash           TEXT NOT NULL,
+    tx_hash        TEXT,
+    completed_iso  TEXT NOT NULL,
+    duration_s     INTEGER,
+    participated   INTEGER NOT NULL,
+    reward_amount  DOUBLE PRECISION,
+    last_updated   DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (node_id, hash)
+)
+"""
+
 
 def init_schema() -> None:
     with _lock, get_conn() as conn:
@@ -156,6 +186,8 @@ def init_schema() -> None:
         conn.execute(_DDL_WALLETS)
         conn.execute(_DDL_DAILY_TOTALS)
         conn.execute(_DDL_ROUNDS_HISTORY)
+        conn.execute(_DDL_UPTIME_SAMPLES)
+        conn.execute(_DDL_ROUNDS)
 
 
 def upsert_daily_total(
@@ -250,4 +282,135 @@ def load_rounds_history(node_id: int) -> dict[str, int]:
                 out[r["hour_key"]] = int(r["rounds"])
             except (TypeError, ValueError):
                 continue
+    return out
+
+
+def insert_uptime_sample(node_id: int, ts: float, alive: bool) -> None:
+    """Append one (node_id, ts, alive) row. ON CONFLICT keeps the existing
+    value so a clock skip that lands a duplicate ts is a no-op rather than
+    crashing the sampler."""
+    with _lock, get_conn() as conn:
+        conn.execute(
+            "INSERT INTO uptime_samples (node_id, ts, alive) VALUES (?, ?, ?) "
+            "ON CONFLICT (node_id, ts) DO NOTHING",
+            (node_id, float(ts), 1 if alive else 0),
+        )
+
+
+def load_uptime_samples_since(node_id: int, since_ts: float) -> list[dict]:
+    """Return [{ts, alive}] for node since since_ts, oldest first."""
+    rows: list[dict] = []
+    with _lock, get_conn() as conn:
+        for r in conn.execute(
+            "SELECT ts, alive FROM uptime_samples "
+            "WHERE node_id = ? AND ts >= ? ORDER BY ts",
+            (node_id, float(since_ts)),
+        ):
+            rows.append({"ts": float(r["ts"]), "alive": bool(r["alive"])})
+    return rows
+
+
+def prune_uptime_samples_older_than(cutoff_ts: float) -> int:
+    """Delete rows with ts < cutoff_ts. Returns the row count deleted (best
+    effort -- SQLite returns rowcount reliably, Postgres also does for DELETE).
+    Cheap to run; the table stays small even without pruning, but unbounded
+    growth on a long-lived Postgres deploy is rude."""
+    with _lock, get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM uptime_samples WHERE ts < ?",
+            (float(cutoff_ts),),
+        )
+        return cur.rowcount or 0
+
+
+def upsert_rounds(node_id: int, rounds: list[dict], snap_date: str, now: float) -> int:
+    """Persist one row per round into the `rounds` table. `snap_date` is the
+    UTC date ("YYYY-MM-DD") used to expand each round's HH:MM:SS into a
+    full ISO timestamp. Returns the number of rows attempted (write count is
+    not reported separately; insert vs update is opaque from the caller).
+
+    Upsert semantics: tx_hash / reward_amount / duration_s use COALESCE so
+    a later push with chain-matched data fills in NULLs an earlier push left
+    behind, but never clobbers existing values with NULL. participated uses
+    MAX so a True flips never go back to False (handles the v9 retag-from-
+    decided_hashes case where observer rounds get reclassified)."""
+    if not rounds or not snap_date:
+        return 0
+    inserted = 0
+    with _lock, get_conn() as conn:
+        for r in rounds:
+            h = r.get("hash")
+            iso = r.get("completed_iso")
+            if not h or not iso:
+                continue
+            # HH:MM:SS -> YYYY-MM-DDTHH:MM:SSZ. Skip if already full ISO.
+            completed_full = iso if "T" in iso else f"{snap_date}T{iso}Z"
+            duration = r.get("duration_s")
+            tx_hash = r.get("tx_hash")
+            reward_amount = r.get("reward_amount")
+            participated = 1 if r.get("participated") else 0
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO rounds (node_id, hash, tx_hash, completed_iso,
+                                        duration_s, participated, reward_amount,
+                                        last_updated)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (node_id, hash) DO UPDATE SET
+                        tx_hash       = COALESCE(EXCLUDED.tx_hash, rounds.tx_hash),
+                        duration_s    = COALESCE(EXCLUDED.duration_s, rounds.duration_s),
+                        participated  = CASE WHEN EXCLUDED.participated > rounds.participated
+                                             THEN EXCLUDED.participated
+                                             ELSE rounds.participated END,
+                        reward_amount = COALESCE(EXCLUDED.reward_amount, rounds.reward_amount),
+                        last_updated  = EXCLUDED.last_updated
+                    """,
+                    (node_id, str(h), tx_hash, completed_full, duration,
+                     participated, reward_amount, now),
+                )
+                inserted += 1
+            except Exception:
+                continue
+    return inserted
+
+
+def load_rounds(
+    node_id: int | None,
+    since_iso: str | None,
+    until_iso: str | None,
+    limit: int,
+) -> list[dict]:
+    """Query rounds, newest first. node_id=None returns all nodes.
+    since_iso/until_iso are full UTC ISO strings ("YYYY-MM-DDTHH:MM:SSZ");
+    lexicographic compare works because the format is sortable."""
+    sql = [
+        "SELECT node_id, hash, tx_hash, completed_iso, duration_s, ",
+        "       participated, reward_amount, last_updated ",
+        "FROM rounds WHERE 1=1 ",
+    ]
+    params: list = []
+    if node_id is not None:
+        sql.append("AND node_id = ? ")
+        params.append(node_id)
+    if since_iso:
+        sql.append("AND completed_iso >= ? ")
+        params.append(since_iso)
+    if until_iso:
+        sql.append("AND completed_iso < ? ")
+        params.append(until_iso)
+    sql.append("ORDER BY completed_iso DESC LIMIT ?")
+    params.append(int(limit))
+    out: list[dict] = []
+    with _lock, get_conn() as conn:
+        for r in conn.execute("".join(sql), tuple(params)):
+            out.append({
+                "node_id": int(r["node_id"]),
+                "hash": r["hash"],
+                "tx_hash": r["tx_hash"],
+                "completed_iso": r["completed_iso"],
+                "duration_s": int(r["duration_s"]) if r["duration_s"] is not None else None,
+                "participated": bool(r["participated"]),
+                "reward_amount": float(r["reward_amount"]) if r["reward_amount"] is not None else None,
+                "last_updated": float(r["last_updated"]),
+            })
     return out

@@ -4,10 +4,12 @@ import os
 import re
 import secrets
 import time
+from collections import deque
 from contextlib import asynccontextmanager
+from typing import Any
 
 import bcrypt
-from fastapi import Cookie, Depends, FastAPI, Form, Header, HTTPException
+from fastapi import Cookie, Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 from pydantic import BaseModel, Field, field_validator
@@ -15,9 +17,19 @@ from pydantic import BaseModel, Field, field_validator
 import wallets as wstore
 from chain import get_for_balance, get_native_balance
 from dashboard_html import DASHBOARD_HTML
-from db import init_schema, load_rounds_history, upsert_rounds_history
+from overview_html import OVERVIEW_HTML
+from db import (
+    init_schema,
+    insert_uptime_sample,
+    load_rounds,
+    load_rounds_history,
+    load_uptime_samples_since,
+    prune_uptime_samples_older_than,
+    upsert_rounds,
+    upsert_rounds_history,
+)
 from login_html import LOGIN_HTML
-from rewards import get_tracker
+from rewards import get_tracker, projections as _projections
 from store import Snapshot, store
 
 _HEX_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -54,6 +66,17 @@ _SIGNER = TimestampSigner(SESSION_SECRET)
 # Whether to mark cookies Secure. False for plain-http local dev; defaults
 # True since production is HTTPS-only on Render.
 _COOKIE_SECURE = os.environ.get("COOKIE_INSECURE", "").lower() not in ("1", "true", "yes")
+
+# --- /login brute-force rate-limit ----------------------------------------
+# Sliding window per client IP. When a single IP racks up
+# LOGIN_RATE_LIMIT_MAX failed POST /login attempts inside
+# LOGIN_RATE_LIMIT_WINDOW_SECS, further attempts get a 429 + Retry-After
+# until the oldest failure ages out. Successful logins clear the counter.
+# In-memory only — fine for the free-tier single-instance deploy; resets
+# on redeploy, which is acceptable for a brute-force defense.
+LOGIN_RATE_LIMIT_MAX = int(os.environ.get("LOGIN_RATE_LIMIT_MAX", "5"))
+LOGIN_RATE_LIMIT_WINDOW_SECS = int(os.environ.get("LOGIN_RATE_LIMIT_WINDOW_SECS", "900"))
+_login_failures: dict[str, deque] = {}
 
 # Balance caches — at 5s dashboard refresh × N viewers, hitting Monad RPC every
 # request gets us rate-limited. Cache per wallet for 30s. Keyed by lowercased
@@ -179,6 +202,40 @@ def _issue_session_cookie(resp: Response) -> None:
     )
 
 
+def _client_ip(request: Request) -> str:
+    # Behind Render's proxy uvicorn is launched with --proxy-headers, so
+    # request.client.host already reflects X-Forwarded-For's first hop.
+    return (request.client.host if request.client else "") or "unknown"
+
+
+def _login_blocked_seconds(ip: str) -> int:
+    """0 if this IP can attempt now; else seconds until the next slot frees.
+    Side-effect: evicts expired failure timestamps from the per-IP deque."""
+    if LOGIN_RATE_LIMIT_MAX <= 0 or LOGIN_RATE_LIMIT_WINDOW_SECS <= 0:
+        return 0
+    now = time.time()
+    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_SECS
+    dq = _login_failures.get(ip)
+    if not dq:
+        return 0
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    if not dq:
+        _login_failures.pop(ip, None)
+        return 0
+    if len(dq) < LOGIN_RATE_LIMIT_MAX:
+        return 0
+    return max(1, int(dq[0] + LOGIN_RATE_LIMIT_WINDOW_SECS - now))
+
+
+def _login_record_failure(ip: str) -> None:
+    _login_failures.setdefault(ip, deque()).append(time.time())
+
+
+def _login_record_success(ip: str) -> None:
+    _login_failures.pop(ip, None)
+
+
 def _active_wallets() -> set[str]:
     wallets: set[str] = set()
     for nid in store.known_node_ids():
@@ -202,6 +259,92 @@ async def _background_rewards_refresher() -> None:
         await asyncio.sleep(_BALANCE_TTL)
 
 
+# --- Uptime sampler -------------------------------------------------------
+# Every UPTIME_SAMPLE_INTERVAL_SECS, snapshot per-node alive-ness into the
+# uptime_samples table. "Alive" = the agent pushed within the last
+# UPTIME_STALE_AFTER_SECS. From the samples we compute rolling 24h / 7d
+# uptime percentages for the dashboard.
+UPTIME_STALE_AFTER_SECS = int(os.environ.get("UPTIME_STALE_AFTER_SECS", "90"))
+UPTIME_SAMPLE_INTERVAL_SECS = int(os.environ.get("UPTIME_SAMPLE_INTERVAL_SECS", "60"))
+UPTIME_RETENTION_DAYS = int(os.environ.get("UPTIME_RETENTION_DAYS", "7"))
+_UPTIME_PRUNE_EVERY_SECS = 3600.0  # once an hour is plenty
+
+
+def _is_alive(snap: Snapshot | None, now: float) -> bool:
+    if snap is None or snap.received_at is None:
+        return False
+    return (now - float(snap.received_at)) < UPTIME_STALE_AFTER_SECS
+
+
+def _uptime_for_node(node_id: int, now: float | None = None) -> dict[str, Any]:
+    """Roll up samples into 24h / 7d percentages. Returns None-shaped values
+    when there's not enough history to make a number meaningful, so the
+    client can render a placeholder instead of a misleading 100%."""
+    if now is None:
+        now = time.time()
+    window_24h = 24 * 3600.0
+    window_7d = 7 * 24 * 3600.0
+    since = now - window_7d
+    samples = load_uptime_samples_since(node_id, since)
+    pct_24h: float | None = None
+    pct_7d: float | None = None
+    n_24h = 0
+    n_7d = len(samples)
+    if n_7d > 0:
+        alive_7d = sum(1 for s in samples if s["alive"])
+        pct_7d = round(100.0 * alive_7d / n_7d, 2)
+    cutoff_24h = now - window_24h
+    samples_24h = [s for s in samples if s["ts"] >= cutoff_24h]
+    n_24h = len(samples_24h)
+    if n_24h > 0:
+        alive_24h = sum(1 for s in samples_24h if s["alive"])
+        pct_24h = round(100.0 * alive_24h / n_24h, 2)
+    return {
+        "pct_24h": pct_24h,
+        "pct_7d": pct_7d,
+        "samples_24h": n_24h,
+        "samples_7d": n_7d,
+        "alive_now": _is_alive(store.get(node_id), now),
+        "stale_after_secs": UPTIME_STALE_AFTER_SECS,
+    }
+
+
+async def _background_uptime_sampler() -> None:
+    """Once per UPTIME_SAMPLE_INTERVAL_SECS, write one (node, ts, alive)
+    row per known node. Prunes rows older than retention every hour."""
+    if UPTIME_SAMPLE_INTERVAL_SECS <= 0:
+        log.info("uptime sampler disabled (UPTIME_SAMPLE_INTERVAL_SECS<=0)")
+        return
+    last_prune = 0.0
+    while True:
+        try:
+            now = time.time()
+            # Sample any node we've ever seen. Skipping store.known_node_ids()
+            # cold (no snapshots) means a node's uptime ledger begins at its
+            # first push -- which is exactly what we want, otherwise we'd
+            # backfill "0% for the last 7d" for a node that just came online.
+            for nid in store.known_node_ids():
+                try:
+                    insert_uptime_sample(nid, now, _is_alive(store.get(nid), now))
+                except Exception as e:  # pragma: no cover -- defensive
+                    log.warning("uptime sample insert failed for node %d: %s", nid, e)
+            if (now - last_prune) >= _UPTIME_PRUNE_EVERY_SECS:
+                cutoff = now - UPTIME_RETENTION_DAYS * 24 * 3600.0
+                try:
+                    deleted = prune_uptime_samples_older_than(cutoff)
+                    if deleted:
+                        log.info("uptime sampler: pruned %d rows older than %dd",
+                                 deleted, UPTIME_RETENTION_DAYS)
+                except Exception as e:  # pragma: no cover
+                    log.warning("uptime prune failed: %s", e)
+                last_prune = now
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover -- never let the loop die
+            log.warning("uptime sampler tick failed: %s", e)
+        await asyncio.sleep(UPTIME_SAMPLE_INTERVAL_SECS)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_schema()
@@ -215,14 +358,17 @@ async def lifespan(_app: FastAPI):
         log.warning("SESSION_SECRET unset -- sessions invalidate on every "
                     "restart (set it in Render to make sessions sticky)")
     refresher = asyncio.create_task(_background_rewards_refresher())
+    sampler = asyncio.create_task(_background_uptime_sampler())
     try:
         yield
     finally:
-        refresher.cancel()
-        try:
-            await refresher
-        except asyncio.CancelledError:
-            pass
+        for t in (refresher, sampler):
+            t.cancel()
+        for t in (refresher, sampler):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(lifespan=lifespan)
@@ -316,6 +462,23 @@ async def v1_status(payload: StatusPayload, authorization: str = Header(None)):
         upsert_rounds_history(snap.node_id, snap.rounds_history)
     except Exception as e:  # pragma: no cover -- defensive, never block a push
         log.warning("rounds_history upsert failed for node %d: %s", snap.node_id, e)
+    # Persist individual rounds. We run the chain-side tx_hash + reward
+    # matcher here so the row goes in with as much enrichment as we have.
+    # tx_hash / reward_amount may be NULL on this push -- a later push will
+    # COALESCE them in once today_transfers has caught up.
+    try:
+        wallet_for_persist = snap.node_wallet or WALLET
+        snap_date = (snap.ts or "")[:10]  # YYYY-MM-DD
+        if snap.all_rounds_today and snap_date:
+            if wallet_for_persist:
+                enriched = get_tracker(wallet_for_persist).attach_tx_hashes(
+                    snap.all_rounds_today, snap_date
+                )
+            else:
+                enriched = snap.all_rounds_today
+            upsert_rounds(snap.node_id, enriched, snap_date, snap.received_at)
+    except Exception as e:  # pragma: no cover -- defensive, never block a push
+        log.warning("rounds upsert failed for node %d: %s", snap.node_id, e)
     return {"ok": True, "received_at": snap.received_at}
 
 
@@ -326,13 +489,14 @@ async def healthz():
 
 @app.get("/", include_in_schema=False)
 async def root():
-    return RedirectResponse(url="/dashboard/1")
+    return RedirectResponse(url="/dashboard")
 
 
-@app.get("/dashboard", include_in_schema=False)
-async def dashboard_legacy():
-    # Keep old bookmarks working. The per-node page lives at /dashboard/{id}.
-    return RedirectResponse(url="/dashboard/1")
+@app.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def dashboard_overview(_: None = Depends(require_login)):
+    # Aggregate view: one tile per node, click to drill into the per-node
+    # page at /dashboard/<id>. Data comes from /v1/dashboard-overview.
+    return HTMLResponse(content=OVERVIEW_HTML)
 
 
 @app.get("/dashboard/{node_id}", response_class=HTMLResponse, include_in_schema=False)
@@ -356,7 +520,36 @@ async def login_form(session: str | None = Cookie(default=None)):
 
 
 @app.post("/login", include_in_schema=False)
-async def login_submit(username: str = Form(...), password: str = Form(...)):
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
+    # Rate-limit check runs BEFORE bcrypt -- otherwise the bcrypt cost
+    # (~100ms per attempt at cost-12) is itself the DoS vector we'd be
+    # paying to "defend against." Only enforced when auth is on; with
+    # auth disabled there's nothing to brute force.
+    ip = _client_ip(request)
+    if AUTH_ENABLED:
+        retry_after = _login_blocked_seconds(ip)
+        if retry_after > 0:
+            log.warning("login rate-limit hit from %s (retry in %ds)", ip, retry_after)
+            return HTMLResponse(
+                content=(
+                    "<!DOCTYPE html><html><body style='font-family:system-ui;"
+                    "background:#0a0a0a;color:#e8e8e8;display:flex;"
+                    "align-items:center;justify-content:center;height:100vh;"
+                    "margin:0;'><div style='text-align:center;max-width:360px;"
+                    "padding:24px;background:#141414;border:1px solid #2a2a2a;"
+                    "border-radius:10px;'><h1 style='font-size:16px;"
+                    "margin-bottom:8px;'>Too many login attempts</h1>"
+                    f"<p style='color:#888;font-size:13px;'>Try again in "
+                    f"{retry_after} seconds.</p></div></body></html>"
+                ),
+                status_code=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+
     # Always run bcrypt so the response time is the same whether the username
     # was wrong, the password was wrong, or auth is disabled -- avoids a
     # timing oracle for "is this a real username?".
@@ -369,9 +562,13 @@ async def login_submit(username: str = Form(...), password: str = Form(...)):
         pw_ok = False
     user_ok = AUTH_ENABLED and username == DASHBOARD_USER
     if user_ok and pw_ok:
+        if AUTH_ENABLED:
+            _login_record_success(ip)
         resp = RedirectResponse(url="/dashboard/1", status_code=303)
         _issue_session_cookie(resp)
         return resp
+    if AUTH_ENABLED:
+        _login_record_failure(ip)
     return RedirectResponse(url="/login?error=1", status_code=303)
 
 
@@ -443,10 +640,12 @@ async def dashboard_data(node: int = 1, _: None = Depends(require_login_json)):
         # few requests after a fresh deploy may see empty data until the
         # background task lands its first successful scan.
         chain_rewards = get_tracker(wallet).summary()
+        projections = _projections(wallet)
     else:
         balance = monad_balance = None
         balance_error = monad_balance_error = None
         chain_rewards = None
+        projections = None
 
     snapshot_dict = None
     if s:
@@ -521,9 +720,95 @@ async def dashboard_data(node: int = 1, _: None = Depends(require_login_json)):
         "monad_balance": monad_balance,
         "monad_balance_error": monad_balance_error,
         "chain_rewards": chain_rewards,
+        "projections": projections,
+        "uptime": _uptime_for_node(node),
         "wallet": wallet,
         "wallet_short": (f"{wallet[:6]}…{wallet[-4:]}" if wallet else None),
         "known_nodes": known_nodes,
         # SPA uses this to decide whether to render the logout button.
         "auth_enabled": AUTH_ENABLED,
     })
+
+
+# Per-round history query. `node` filters to one node when set; omitting
+# returns all nodes. `since` / `until` are full UTC ISO strings
+# ("YYYY-MM-DDTHH:MM:SSZ") and compare lexicographically against the
+# stored completed_iso. `limit` capped at ROUNDS_QUERY_MAX to keep payload
+# size predictable for casual exploration; bump the env var for bulk pulls.
+_ROUNDS_QUERY_MAX = int(os.environ.get("ROUNDS_QUERY_MAX", "1000"))
+
+
+@app.get("/v1/rounds")
+async def v1_rounds(
+    node: int | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 200,
+    _: None = Depends(require_login_json),
+):
+    if limit < 1:
+        limit = 1
+    if limit > _ROUNDS_QUERY_MAX:
+        limit = _ROUNDS_QUERY_MAX
+    rows = load_rounds(node, since, until, limit)
+    return {"rounds": rows, "count": len(rows), "limit": limit}
+
+
+@app.get("/v1/dashboard-overview")
+async def dashboard_overview_data(_: None = Depends(require_login_json)):
+    """Per-node tile data + summed totals for the /dashboard overview page.
+    Deduplicates `earned_today` per distinct wallet so two nodes sharing one
+    operator wallet don't double-count the day's payouts."""
+    now = time.time()
+    known = sorted(set(store.known_node_ids()) | {1, 2})
+    nodes_out: list[dict] = []
+    earned_per_wallet: dict[str, float] = {}
+    total_participations = 0
+    nodes_active = 0
+    for nid in known:
+        s = store.get(nid)
+        # Fall back to server's WALLET env only for node 1 (mirrors legacy
+        # behavior in /v1/dashboard-data); other nodes need an explicit
+        # node_wallet on their push to show a wallet.
+        wallet = (s.node_wallet if s else None) or (WALLET if nid == 1 else None)
+        earned_for_node: float | None = None
+        if wallet:
+            wlc = wallet.lower()
+            if wlc in earned_per_wallet:
+                earned_for_node = earned_per_wallet[wlc]
+            else:
+                try:
+                    summary = get_tracker(wallet).summary()
+                    earned_for_node = float(summary.get("earned_today") or 0.0)
+                except Exception:  # pragma: no cover -- defensive
+                    earned_for_node = None
+                if earned_for_node is not None:
+                    earned_per_wallet[wlc] = earned_for_node
+        up = _uptime_for_node(nid, now)
+        if s is not None:
+            nodes_active += 1
+            total_participations += int(s.rounds_participated_today or 0)
+        nodes_out.append({
+            "node_id": nid,
+            "wallet": wallet,
+            "wallet_short": (f"{wallet[:6]}…{wallet[-4:]}" if wallet else None),
+            "received_at": s.received_at if s else None,
+            "ts": s.ts if s else None,
+            "earned_today": earned_for_node,
+            "tps_current": s.tps_current if s else None,
+            "rounds_participated_today": (s.rounds_participated_today if s else 0),
+            "capsule_alive": (s.capsule_alive if s else False),
+            "protocol_alive": (s.protocol_alive if s else False),
+            "uptime_pct_24h": up.get("pct_24h"),
+        })
+    return {
+        "nodes": nodes_out,
+        "totals": {
+            "earned_today": round(sum(earned_per_wallet.values()), 6),
+            "distinct_wallets": len(earned_per_wallet),
+            "nodes_active": nodes_active,
+            "nodes_known": len(known),
+            "rounds_participated_today": total_participations,
+        },
+        "auth_enabled": AUTH_ENABLED,
+    }

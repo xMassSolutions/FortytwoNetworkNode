@@ -60,9 +60,13 @@ a { color: var(--blue); text-decoration: none; }
     </form>
   </header>
   <!-- Node tab strip — populated by JS from /v1/dashboard-data.known_nodes -->
-  <div class="toggle-group" id="node-tabs" style="margin-bottom:16px"></div>
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap">
+    <a href="/dashboard" class="toggle-btn" style="text-decoration:none">&larr; All nodes</a>
+    <div class="toggle-group" id="node-tabs"></div>
+  </div>
   <div class="grid">
     <div class="card"><h2>FOR Balance (Monad Testnet)</h2><div id="balance-content">…</div></div>
+    <div class="card"><h2>Earnings projection</h2><div id="projection-content">…</div></div>
     <div class="card">
       <div class="section-header" style="margin-bottom:12px">
         <h2 id="node-title" style="margin-bottom:0">Node</h2>
@@ -157,10 +161,39 @@ const LOG_EVENT_RE = /Completed inference participation|Inference round \w+ comp
 let tpsMode = 'actual';
 let lastSnapshot = null;
 let lastChainRewards = null;  // most recent chain_rewards payload — needed by chart-mode toggle
+let lastUptime = null;        // most recent uptime payload — needed when re-rendering on toggles
 
 function pad(n){ return String(n).padStart(2,'0'); }
 function fmt(v){return v==null?'—':v;}
 function fmtNum(n){return n==null?'—':Number(n).toLocaleString(undefined,{maximumFractionDigits:2});}
+function updateProjection(p){
+  // Prefer today's pace (projected forward from elapsed UTC hours). If
+  // it's too early in the day (server suppresses the fields below ~1h
+  // elapsed) we fall back to the 7-day average so the card is never blank
+  // mid-day. With neither -- show a friendly placeholder.
+  const el = document.getElementById('projection-content');
+  if (!p) { el.innerHTML = '<div style="color:var(--muted);font-size:13px">Awaiting on-chain data…</div>'; return; }
+  const hasToday = p.today_projected_weekly != null;
+  const hasAvg = p.avg_7d_daily != null;
+  if (!hasToday && !hasAvg) {
+    el.innerHTML =
+      `<div style="color:var(--muted);font-size:13px">Not enough history yet — earn FOR through a UTC day to project.</div>`
+      + `<div class="balance-reward" style="color:var(--muted)">${p.hours_elapsed?.toFixed(1) ?? '0'}h into today's UTC day</div>`;
+    return;
+  }
+  let html = '';
+  if (hasToday) {
+    html += `<div class="balance-big">${fmtNum(p.today_projected_weekly)} <span style="color:var(--muted);font-size:14px;font-weight:400">FOR / wk</span></div>`;
+    html += `<div class="balance-reward">${fmtNum(p.today_projected_daily)} FOR/day · ${fmtNum(p.today_projected_monthly)} FOR/mo</div>`;
+    html += `<div class="balance-reward" style="color:var(--muted)">today's pace · ${p.hours_elapsed?.toFixed(1) ?? '0'}h elapsed</div>`;
+  } else {
+    html += `<div style="color:var(--muted);font-size:13px;margin-bottom:6px">Pace projection paused — too early in UTC day.</div>`;
+  }
+  if (hasAvg) {
+    html += `<div class="balance-reward" style="color:var(--muted)">7-day avg: ${fmtNum(p.avg_7d_daily)} FOR/day (${p.days_used_for_avg}d seen)</div>`;
+  }
+  el.innerHTML = html;
+}
 function fmtAgo(epoch){if(!epoch)return'never';const d=Date.now()/1000-epoch;if(d<60)return`${Math.round(d)}s ago`;if(d<3600)return`${Math.round(d/60)}m ago`;if(d<86400)return`${Math.round(d/3600)}h ago`;return`${Math.round(d/86400)}d ago`;}
 function fmtUp(s){if(!s)return'—';const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);if(d>0)return`${d}d ${h}h`;if(h>0)return`${h}h ${m}m`;return`${m}m`;}
 function row(l,v){return`<div class="row"><span class="label">${l}</span><span class="value">${v}</span></div>`;}
@@ -313,12 +346,34 @@ function renderTpsRows(s){
     + row('Symbols/sec', s.symbols_current != null ? fmtNum(s.symbols_current) : '—');
 }
 
-function renderNodeCard(s){
+function fmtPct(v){ return v==null ? '—' : `${Number(v).toFixed(1)}%`; }
+function renderUptimeRow(u){
+  // u is the server-rolled uptime object. We show 24h / 7d side-by-side
+  // with sample counts in muted parens so the operator can tell whether
+  // 100% is "yes, perfect" vs "yes, only 3 samples so far".
+  if (!u) return '';
+  const samples24 = u.samples_24h || 0;
+  const samples7d = u.samples_7d || 0;
+  // No samples yet -> placeholder. Samples take a minute each to accumulate
+  // so it's normal for a brand-new node to show "—" briefly.
+  if (!samples24 && !samples7d) {
+    return row('Heartbeat uptime', '<span style="color:var(--muted);font-size:12px">collecting…</span>');
+  }
+  const colour = (p) => p == null ? 'var(--muted)' : (p >= 99 ? 'var(--green)' : (p >= 90 ? 'var(--text)' : 'var(--red)'));
+  const c24 = colour(u.pct_24h);
+  const c7d = colour(u.pct_7d);
+  return row('Heartbeat uptime',
+    `<span style="color:${c24}">${fmtPct(u.pct_24h)}</span> <span style="color:var(--muted);font-size:11px">24h (${samples24})</span>`
+    + ` <span style="color:var(--muted)">·</span> `
+    + `<span style="color:${c7d}">${fmtPct(u.pct_7d)}</span> <span style="color:var(--muted);font-size:11px">7d (${samples7d})</span>`
+  );
+}
+function renderNodeCard(s, uptime){
   const titleEl = document.getElementById('node-title');
   const el = document.getElementById('node-content');
   if (!s) {
     if (titleEl) titleEl.style.color = '';
-    el.innerHTML = row('Status', '<span class="badge down">No data</span>');
+    el.innerHTML = row('Status', '<span class="badge down">No data</span>') + renderUptimeRow(uptime);
     return;
   }
   const alive = s.capsule_alive && s.protocol_alive;
@@ -340,7 +395,8 @@ function renderNodeCard(s){
     + renderTpsRows(s)
     + row('Capsule', `${s.capsule_version||'—'} <span style="color:var(--muted)">PID ${s.capsule_pid||'—'}</span>`)
     + row('Protocol', `${s.protocol_version||'—'} <span style="color:var(--muted)">PID ${s.protocol_pid||'—'}</span>`)
-    + row('Uptime', fmtUp(s.capsule_uptime_seconds));
+    + row('Uptime', fmtUp(s.capsule_uptime_seconds))
+    + renderUptimeRow(uptime);
 }
 
 async function refresh(){
@@ -357,6 +413,7 @@ async function refresh(){
   const s = data.snapshot;
   lastSnapshot = s;
   lastChainRewards = data.chain_rewards || null;
+  lastUptime = data.uptime || null;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
 
   // Reveal the logout button only when the server says auth is enabled.
@@ -394,11 +451,11 @@ async function refresh(){
     : '<span class="badge down">No data</span> — workstation agent has not pushed yet';
 
   if(!s){
-    document.getElementById('node-content').innerHTML = row('Status','<span class="badge down">No data</span>');
+    renderNodeCard(null, lastUptime);
     document.getElementById('today-content').innerHTML = row('Status','—');
     document.getElementById('rounds-body').innerHTML = '<tr><td colspan="3" style="color:var(--muted);text-align:center">No data</td></tr>';
   } else {
-    renderNodeCard(s);
+    renderNodeCard(s, lastUptime);
 
     const participated = s.rounds_participated_today || 0;
     // wins_today now mirrors participations on the agent side. rewards_logged_today
@@ -469,6 +526,8 @@ async function refresh(){
   } else {
     document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${data.balance_error||'unknown'}</div>`;
   }
+
+  updateProjection(data.projections);
 
   updateChart(s ? s.rounds_history : {}, lastChainRewards ? lastChainRewards.transfers_by_hour : {});
   updateErrors(s);
@@ -558,7 +617,7 @@ document.querySelectorAll('.toggle-btn[data-tps]').forEach(btn => {
   btn.addEventListener('click', () => {
     tpsMode = btn.dataset.tps;
     document.querySelectorAll('.toggle-btn[data-tps]').forEach(b => b.classList.toggle('active', b.dataset.tps === tpsMode));
-    if (lastSnapshot) renderNodeCard(lastSnapshot);
+    if (lastSnapshot) renderNodeCard(lastSnapshot, lastUptime);
   });
 });
 

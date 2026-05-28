@@ -35,9 +35,9 @@ $RepoRoot = Split-Path $PSScriptRoot -Parent
 $AutoUpdateMinutes = if ($NoAutoUpdate) {
     0
 } elseif ($env:FORTYTWO_AUTOUPDATE_MINUTES) {
-    try { [int]$env:FORTYTWO_AUTOUPDATE_MINUTES } catch { 30 }
+    try { [int]$env:FORTYTWO_AUTOUPDATE_MINUTES } catch { 5 }
 } else {
-    30
+    5
 }
 
 function Get-AgentVersion {
