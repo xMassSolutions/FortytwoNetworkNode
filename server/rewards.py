@@ -347,18 +347,30 @@ class RewardsTracker:
         Completion-anchored matching:
           Rewards land on-chain AFTER a round completes (the Capsule submits
           intent resolution post-completion), so each round's match window is
-          centred on its completion time — a transfer is a candidate iff its
-          ts is within ±pad of `completed_ts`. Among candidates, transfers
-          at/after completion are preferred over earlier ones (the only reason
-          to look before completion is workstation/chain clock skew), then by
-          closeness to completion. Greedy in completion order so earlier
-          rounds claim first; the `used` set stops one transfer being claimed
-          twice. Two passes:
-            1. STRICT  pad = `pad_seconds`     (default 300 s = ±5 min)
-            2. RELAXED pad = `pad_seconds * 6` (default 30 min) for rounds
-               still unmatched — deferred-resolution rounds (the Capsule logs
-               `Waiting for N milliseconds before resolving intent`, observed
-               >5 min in the wild).
+          anchored at its completion time and is ASYMMETRIC: it reaches only a
+          small clock-skew slack backward but the full deferred-resolution
+          allowance forward. A transfer is a candidate iff its ts is in
+          `[completed_ts - back_pad, completed_ts + fwd_pad]`. Among candidates,
+          transfers at/after completion are preferred over earlier ones (the
+          only reason to look before completion is workstation/chain clock
+          skew), then by closeness to completion. Greedy in completion order so
+          earlier rounds claim first; the `used` set stops one transfer being
+          claimed twice. Two passes:
+            1. STRICT  back=fwd=`pad_seconds` (default ±5 min).
+            2. RELAXED extend FORWARD only to `pad_seconds * 6` (default 30 min)
+               for deferred-resolution rounds (the Capsule logs `Waiting for N
+               milliseconds before resolving intent`, observed >5 min in the
+               wild); backward stays at `pad_seconds`. Widening backward to
+               30 min is exactly how a later round used to claim an earlier
+               round's transfer -- a transfer that landed minutes before a
+               round completed can't be that round's reward.
+            3. GAP-FILL for anything still unmatched: a reward often only
+               lands on-chain by the time the NEXT round begins (past the
+               relaxed window, or after the last scan for the most recent
+               round). In completion order, claim the earliest unused
+               transfer in the gap `[this completion, next completion)` —
+               open-ended for the most recent round. Additive: never
+               re-claims a transfer or round already matched above.
           Earlier versions (v10.1) anchored on the round midpoint and extended
           the window backward by the full round duration. With long durations
           and concurrent rounds that let an earlier round reach back and steal
@@ -416,11 +428,12 @@ class RewardsTracker:
         )
         matches: dict[int, tuple[str, float]] = {}
 
-        def _do_pass(pad: int) -> None:
+        def _do_pass(back_pad: int, fwd_pad: int) -> None:
             """Run one greedy pass: each unmatched participation claims the
-            unused transfer nearest its completion time within ±pad, preferring
-            transfers at/after completion (rewards post-date the round). Updates
-            `matches` and `used` in place."""
+            unused transfer nearest its completion time, within `back_pad`
+            before completion and `fwd_pad` after (asymmetric -- rewards
+            post-date the round, so backward is only clock-skew slack).
+            Prefers transfers at/after completion. Updates `matches`/`used`."""
             for orig_i in order:
                 if orig_i in matches:
                     continue  # already matched in a previous pass
@@ -434,8 +447,8 @@ class RewardsTracker:
                 completed_ts = _completed_ts(r)
                 if completed_ts is None:
                     continue
-                lo = completed_ts - pad
-                hi = completed_ts + pad
+                lo = completed_ts - back_pad
+                hi = completed_ts + fwd_pad
                 best_ai = None
                 best_key: tuple[int, int] | None = None
                 for ai, (ts, _tx, _amt) in enumerate(avail):
@@ -455,11 +468,42 @@ class RewardsTracker:
                     used.add(best_ai)
                     matches[orig_i] = (avail[best_ai][1], avail[best_ai][2])
 
-        # Pass 1: strict window.
-        _do_pass(pad_seconds)
-        # Pass 2: relaxed window for leftovers. 6x covers deferred-
-        # resolution and overlapping-window losers without going wild.
-        _do_pass(pad_seconds * 6)
+        # Pass 1: strict symmetric window (back side is just clock-skew slack).
+        _do_pass(pad_seconds, pad_seconds)
+        # Pass 2: relaxed -- extend FORWARD only for deferred resolution.
+        # Backward stays at pad_seconds: a transfer that landed >5 min before a
+        # round completed can't be its reward, and widening backward to 30 min
+        # is exactly how a later round used to steal an earlier round's tx.
+        _do_pass(pad_seconds, pad_seconds * 6)
+
+        # Pass 3 (sequential inter-round gap-fill): a round's reward often only
+        # lands on-chain by the time the NEXT round begins -- past the relaxed
+        # window above, or after the last scan for the most recent round. For
+        # each still-unmatched participation, in completion order, claim the
+        # earliest unused transfer in the gap [this completion, next completion);
+        # open-ended for the most recent round. `avail` is ts-sorted, so the
+        # first in-gap hit is the earliest. Additive only: never touches rounds
+        # already matched / agent-attached, never re-claims a used transfer.
+        def _do_gap_pass() -> None:
+            seq = [i for i in order if _completed_ts(rounds[i]) is not None]
+            for pos, orig_i in enumerate(seq):
+                r = rounds[orig_i]
+                if orig_i in matches or r.get("tx_hash"):
+                    continue
+                if r.get("participated", True) is False:
+                    continue
+                ci = _completed_ts(r)
+                c_next = _completed_ts(rounds[seq[pos + 1]]) if pos + 1 < len(seq) else None
+                for ai, (ts, _tx, _amt) in enumerate(avail):
+                    if ai in used or ts < ci:
+                        continue
+                    if c_next is not None and ts >= c_next:
+                        break  # ts-sorted: no later transfer can be in-gap either
+                    used.add(ai)
+                    matches[orig_i] = (avail[ai][1], avail[ai][2])
+                    break
+
+        _do_gap_pass()
 
         # Rebuild in original order with matched tx_hash + reward_amount
         # injected. reward_amount lets persisters (the rounds table) capture
