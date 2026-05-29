@@ -2,7 +2,7 @@
 #
 # Run this from an admin PowerShell when you want to pull the latest
 # code from origin/main and bounce the agent right now (instead of
-# waiting up to 30 min for the built-in auto-updater).
+# waiting up to 5 min for the built-in auto-updater).
 #
 # Handles:
 #   - git pull --ff-only
@@ -44,7 +44,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "[2/4] Stopping scheduled task + any stray push-agent processes"
-& schtasks /End /TN $TaskName 2>&1 | ForEach-Object { Write-Host "  $_" }
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 try {
     $myPid = $PID
@@ -66,7 +66,7 @@ Start-Sleep -Seconds 3
 
 Write-Host ""
 Write-Host "[3/4] Starting scheduled task"
-& schtasks /Run /TN $TaskName 2>&1 | ForEach-Object { Write-Host "  $_" }
+Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 
 Start-Sleep -Seconds 10
 

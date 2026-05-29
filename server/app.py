@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import logging
 import os
 import re
@@ -435,7 +436,7 @@ class StatusPayload(BaseModel):
 
 
 def _require_agent_token(authorization: str | None) -> None:
-    if authorization != f"Bearer {AGENT_TOKEN}":
+    if not hmac.compare_digest(authorization or "", f"Bearer {AGENT_TOKEN}"):
         raise HTTPException(status_code=401, detail="invalid token")
 
 
@@ -603,12 +604,12 @@ async def list_wallets(_: None = Depends(require_login_json)):
         mon_bal = None
         try:
             for_bal = await get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, addr)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("FOR balance fetch failed for %s: %s", addr, e)
         try:
             mon_bal = await get_native_balance(MONAD_RPC_URL, addr)
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("MONAD balance fetch failed for %s: %s", addr, e)
         enriched.append({
             "address": addr,
             "label": w.get("label"),

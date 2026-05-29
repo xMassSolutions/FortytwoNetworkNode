@@ -836,14 +836,14 @@ def event_loop(args: argparse.Namespace, scripts_root: Path, history_file: Path)
 
     # Auto-update cadence (minutes between git ls-remote checks). 0 disables.
     # Explicit --no-auto-update wins; otherwise FORTYTWO_AUTOUPDATE_MINUTES env;
-    # otherwise default 30.
+    # otherwise default 5 (matches the PowerShell agent + README).
     if args.no_auto_update:
         auto_update_minutes = 0
     else:
         try:
-            auto_update_minutes = int(os.environ.get("FORTYTWO_AUTOUPDATE_MINUTES", "30"))
+            auto_update_minutes = int(os.environ.get("FORTYTWO_AUTOUPDATE_MINUTES", "5"))
         except ValueError:
-            auto_update_minutes = 30
+            auto_update_minutes = 5
     auto_update_banner = (
         f"auto-update every {auto_update_minutes}m" if auto_update_minutes > 0 else "auto-update disabled"
     )

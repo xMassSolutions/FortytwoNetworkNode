@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from chain import (
     get_block_timestamp,
     get_latest_block,
@@ -207,8 +209,13 @@ class RewardsTracker:
             except Exception as e:
                 msg = str(e)
                 last_err = f"{type(e).__name__}: {msg}"
-                # Halve only on size-related errors; bail on other errors.
-                if "413" not in msg and "Too Large" not in msg and "timeout" not in msg.lower():
+                # Halve only on size-related errors and timeouts; bail on other errors.
+                # httpx.TimeoutException covers Connect/Read/Write/PoolTimeout (the
+                # actual client below is httpx via chain.rpc_call). The substring
+                # check is a defensive net for wrapped/upstream errors whose message
+                # mentions timeout but whose type we can't predict.
+                is_timeout = isinstance(e, httpx.TimeoutException) or "timeout" in msg.lower()
+                if not is_timeout and "413" not in msg and "Too Large" not in msg:
                     return [], cursor - 1, last_err
                 span = attempt_end - cursor + 1
                 if span <= _MIN_CHUNK_SIZE:
@@ -267,22 +274,32 @@ class RewardsTracker:
 
                 # Annotate with block timestamp (one extra RPC per unique block,
                 # capped per chunk so a transfer-heavy block range can't blow
-                # out the per-request budget).
+                # out the per-request budget). When the cap is hit or a lookup
+                # fails, approximate from the most recent block timestamp we DID
+                # resolve in this chunk. eth_getLogs returns events ascending by
+                # (block, logIndex), so that value is a near lower-bound (off by
+                # at most ~chunk-span, tens of seconds on Monad) -- close enough
+                # that attach_tx_hashes can still pair the transfer to a round
+                # and transfers_by_hour buckets it into the right hour. Slamming
+                # to midnight (the old fallback) put these at 00:00:00, which is
+                # ~never inside a round's match window and bucketed every capped
+                # transfer into hour 00.
                 seen_block_ts: dict[int, int] = {}
                 ts_lookups = 0
+                last_real_ts = self.today_midnight_ts or 0
                 for ev in events:
                     bn = ev["block_number"]
                     if bn not in seen_block_ts:
                         if ts_lookups >= _MAX_BLOCK_TS_LOOKUPS_PER_CHUNK:
-                            # Skip the timestamp lookup; approximate from chunk_end
-                            # block time (close enough for "today" filtering).
-                            seen_block_ts[bn] = self.today_midnight_ts or 0
+                            seen_block_ts[bn] = last_real_ts
                         else:
                             try:
-                                seen_block_ts[bn] = await get_block_timestamp(rpc_url, bn)
+                                real = await get_block_timestamp(rpc_url, bn)
+                                seen_block_ts[bn] = real
+                                last_real_ts = real
                                 ts_lookups += 1
                             except Exception:
-                                seen_block_ts[bn] = self.today_midnight_ts or 0
+                                seen_block_ts[bn] = last_real_ts
                     ts = seen_block_ts[bn]
                     if ts < (self.today_midnight_ts or 0):
                         continue
@@ -327,25 +344,31 @@ class RewardsTracker:
         Chain-side matching is format-independent and uses the authoritative
         Monad receipt.
 
-        Two-pass strategy (v10.1):
-          1. STRICT pass with `pad_seconds` (default 300 s) — for each
-             unmatched participation, take the closest unused transfer
-             whose ts falls inside `[start_ts - pad, completed_ts + pad]`.
-             Greedy in completed-ts order so earlier rounds claim first.
-          2. RELAXED pass with `pad_seconds * 6` (default 30 min) — for
-             rounds still unmatched after pass 1. Same `used` set so a
-             pass-1 winner can't be re-claimed.
-          Pass 2 catches:
-             - deferred-resolution rounds (the Capsule logs
-               `Waiting for N milliseconds before resolving intent`,
-               where N has been observed >5 min in the wild)
-             - rounds whose strict-window neighbor stole the tx
-        Risk acknowledged: pass 2 can mis-attribute. Since observer rounds
-        are already skipped (`participated: False`) and `used` prevents
-        stealing pass-1 winners, the worst case is "tx_hash points at a
-        nearby wallet credit rather than this exact round" — the operator
-        can verify on monadscan; showing `—` for half their participations
-        is worse UX.
+        Completion-anchored matching:
+          Rewards land on-chain AFTER a round completes (the Capsule submits
+          intent resolution post-completion), so each round's match window is
+          centred on its completion time — a transfer is a candidate iff its
+          ts is within ±pad of `completed_ts`. Among candidates, transfers
+          at/after completion are preferred over earlier ones (the only reason
+          to look before completion is workstation/chain clock skew), then by
+          closeness to completion. Greedy in completion order so earlier
+          rounds claim first; the `used` set stops one transfer being claimed
+          twice. Two passes:
+            1. STRICT  pad = `pad_seconds`     (default 300 s = ±5 min)
+            2. RELAXED pad = `pad_seconds * 6` (default 30 min) for rounds
+               still unmatched — deferred-resolution rounds (the Capsule logs
+               `Waiting for N milliseconds before resolving intent`, observed
+               >5 min in the wild).
+          Earlier versions (v10.1) anchored on the round midpoint and extended
+          the window backward by the full round duration. With long durations
+          and concurrent rounds that let an earlier round reach back and steal
+          a later round's transfer, leaving the later round showing `—`.
+        Risk acknowledged: this is still a time-only match, so when on-chain
+        resolution order differs from completion order it can mis-attribute.
+        Since observer rounds are skipped (`participated: False`) and `used`
+        prevents double-claims, the worst case is "tx_hash points at a nearby
+        wallet credit rather than this exact round" — verifiable on monadscan;
+        showing `—` for half the participations is worse UX.
 
         Returns a NEW list (doesn't mutate input). Rounds with a non-null
         tx_hash already populated by the agent are left untouched.
@@ -373,35 +396,30 @@ class RewardsTracker:
         )
         used: set[int] = set()
 
-        def _round_interval(r: dict[str, Any]) -> tuple[int, int, int] | None:
-            """Return (start_ts, completed_ts, mid_ts) or None."""
+        def _completed_ts(r: dict[str, Any]) -> int | None:
+            """Round completion time as a UTC epoch, or None if unparseable.
+            Built from `completed_iso` (HH:MM:SS) + the day's midnight."""
             iso = r.get("completed_iso")
             if not iso:
                 return None
             try:
                 h, m, s = (int(x) for x in str(iso).split(":"))
-                completed = midnight_ts + h * 3600 + m * 60 + s
-                duration = int(r.get("duration_s") or 0)
-                start = completed - duration
-                mid = (start + completed) // 2
-                return start, completed, mid
+                return midnight_ts + h * 3600 + m * 60 + s
             except Exception:
                 return None
 
-        # Pre-compute completion ts for ordering; rounds with no interval
-        # sink to the end and are skipped during the match.
-        def _completed(i: int) -> int:
-            iv = _round_interval(rounds[i])
-            return iv[1] if iv else 0
+        # Greedy in completion order so earlier rounds claim first; rounds with
+        # no parseable completion time sink to the end and are skipped.
         order = sorted(
             range(len(rounds)),
-            key=lambda i: (_round_interval(rounds[i]) is None, _completed(i)),
+            key=lambda i: (_completed_ts(rounds[i]) is None, _completed_ts(rounds[i]) or 0),
         )
         matches: dict[int, tuple[str, float]] = {}
 
         def _do_pass(pad: int) -> None:
             """Run one greedy pass: each unmatched participation claims the
-            unused transfer closest to its mid_ts within ±pad. Updates
+            unused transfer nearest its completion time within ±pad, preferring
+            transfers at/after completion (rewards post-date the round). Updates
             `matches` and `used` in place."""
             for orig_i in order:
                 if orig_i in matches:
@@ -413,22 +431,25 @@ class RewardsTracker:
                 # with pre-v8.6 snapshots that don't emit `participated`.
                 if r.get("participated", True) is False:
                     continue
-                iv = _round_interval(r)
-                if iv is None:
+                completed_ts = _completed_ts(r)
+                if completed_ts is None:
                     continue
-                start_ts, completed_ts, mid_ts = iv
-                lo = start_ts - pad
+                lo = completed_ts - pad
                 hi = completed_ts + pad
                 best_ai = None
-                best_delta = float("inf")
+                best_key: tuple[int, int] | None = None
                 for ai, (ts, _tx, _amt) in enumerate(avail):
                     if ai in used:
                         continue
                     if ts < lo or ts > hi:
                         continue
-                    d = abs(ts - mid_ts)
-                    if d < best_delta:
-                        best_delta = d
+                    # Forward bias: at/after-completion transfers (group 0) rank
+                    # ahead of pre-completion ones (group 1), then by closeness
+                    # to completion. The only reason to match a pre-completion
+                    # transfer is clock skew, so it's a last resort.
+                    key = (0 if ts >= completed_ts else 1, abs(ts - completed_ts))
+                    if best_key is None or key < best_key:
+                        best_key = key
                         best_ai = ai
                 if best_ai is not None:
                     used.add(best_ai)

@@ -561,7 +561,7 @@ async function refresh(){
       + (cr.transfers_today ? `<div class="balance-reward" style="color:var(--muted)">${cr.transfers_today} distributions today</div>` : '')
       + (lastAmt ? `<div class="balance-reward" style="color:var(--muted)">last +${fmtNum(lastAmt)} FOR at ${lastIso||'—'} UTC</div>` : '');
   } else {
-    document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${data.balance_error||'unknown'}</div>`;
+    document.getElementById('balance-content').innerHTML = `<div style="color:var(--red);font-size:13px">RPC error: ${escapeHtml(data.balance_error||'unknown')}</div>`;
   }
 
   updateProjection(data.projections);
@@ -583,18 +583,19 @@ async function refreshWallets(){
       const op = w.is_operator ? ' <span class="badge ok" style="margin-left:4px">OPERATOR</span>' : '';
       const forBal = w.for_balance != null ? fmtNum(w.for_balance) : '—';
       const monBal = w.monad_balance != null ? Number(w.monad_balance).toFixed(4) : '—';
-      const label = w.label || '<span style="color:var(--muted)">—</span>';
-      const short = `${w.address.slice(0,8)}…${w.address.slice(-6)}`;
+      const label = w.label ? escapeHtml(w.label) : '<span style="color:var(--muted)">—</span>';
+      const addr = String(w.address || '');
+      const short = escapeHtml(`${addr.slice(0,8)}…${addr.slice(-6)}`);
       return `<tr>
         <td style="font-size:12px">${short}${op}</td>
         <td>${label}</td>
         <td>${forBal}</td>
         <td>${monBal}</td>
-        <td><button onclick="copyAddr('${w.address}')" style="background:none;border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">copy</button></td>
+        <td><button onclick="copyAddr('${escapeHtml(addr)}')" style="background:none;border:1px solid var(--border);color:var(--muted);padding:2px 8px;border-radius:4px;cursor:pointer;font-size:11px">copy</button></td>
       </tr>`;
     }).join('');
   } catch(e){
-    document.getElementById('wallets-body').innerHTML = `<tr><td colspan="5" style="color:var(--red);text-align:center">load error: ${e.message}</td></tr>`;
+    document.getElementById('wallets-body').innerHTML = `<tr><td colspan="5" style="color:var(--red);text-align:center">load error: ${escapeHtml(e.message)}</td></tr>`;
   }
 }
 

@@ -369,7 +369,7 @@ def upsert_rounds(node_id: int, rounds: list[dict], snap_date: str, now: float) 
                      participated, reward_amount, now),
                 )
                 inserted += 1
-            except Exception:
+            except (TypeError, ValueError):
                 continue
     return inserted
 
