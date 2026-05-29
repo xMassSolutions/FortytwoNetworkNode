@@ -22,6 +22,7 @@ from overview_html import OVERVIEW_HTML
 from db import (
     init_schema,
     insert_uptime_sample,
+    load_round_tx,
     load_rounds,
     load_rounds_history,
     load_uptime_samples_since,
@@ -440,6 +441,27 @@ def _require_agent_token(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid token")
 
 
+def _prefill_persisted_tx(
+    rounds: list[dict], persisted: dict[str, tuple[str, float | None]]
+) -> list[dict]:
+    """Return copies of `rounds` with tx_hash/reward_amount filled in from
+    already-persisted DB rows (keyed by round hash), for rounds that don't
+    already carry a tx. Feeding these claims back in makes the matcher's
+    `already_claimed` exclude transfers used on earlier pushes, so the same
+    transfer can't be re-attached to a second round (cross-push dup fix)."""
+    if not persisted:
+        return rounds
+    out: list[dict] = []
+    for r in rounds:
+        p = persisted.get(r.get("hash")) if not r.get("tx_hash") else None
+        if p and p[0]:
+            r = {**r, "tx_hash": p[0]}
+            if r.get("reward_amount") is None:
+                r["reward_amount"] = p[1]
+        out.append(r)
+    return out
+
+
 @app.post("/v1/status")
 async def v1_status(payload: StatusPayload, authorization: str = Header(None)):
     _require_agent_token(authorization)
@@ -472,8 +494,22 @@ async def v1_status(payload: StatusPayload, authorization: str = Header(None)):
         snap_date = (snap.ts or "")[:10]  # YYYY-MM-DD
         if snap.all_rounds_today and snap_date:
             if wallet_for_persist:
+                # The chain matcher is the SOLE authority for tx attribution.
+                # 1) Drop any agent-supplied tx_hash (legacy receipt-hash
+                #    parsing): it attributes by log proximity and can disagree
+                #    with the chain match, stamping one on-chain transfer onto a
+                #    second round (the [amt, None] duplicate class).
+                # 2) Restore prior chain-matched tx from the DB (cross-push
+                #    stability) so a transfer already assigned to one round is in
+                #    `already_claimed` and can't be re-attached to another round
+                #    on a later push (the [amt, amt] duplicate class).
+                # 3) Let the matcher attribute everything still unclaimed.
+                base = [{k: v for k, v in r.items() if k != "tx_hash"}
+                        for r in snap.all_rounds_today]
+                persisted = load_round_tx(snap.node_id, snap_date)
+                rounds_in = _prefill_persisted_tx(base, persisted)
                 enriched = get_tracker(wallet_for_persist).attach_tx_hashes(
-                    snap.all_rounds_today, snap_date
+                    rounds_in, snap_date
                 )
             else:
                 enriched = snap.all_rounds_today

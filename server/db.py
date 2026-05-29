@@ -414,3 +414,25 @@ def load_rounds(
                 "last_updated": float(r["last_updated"]),
             })
     return out
+
+
+def load_round_tx(node_id: int, day_prefix: str) -> dict[str, tuple[str, float | None]]:
+    """Return {round hash -> (tx_hash, reward_amount)} for the node's rounds on
+    `day_prefix` (a "YYYY-MM-DD" string) that already have a tx_hash persisted.
+
+    Used to seed the matcher with cross-push claims: pre-filling these onto the
+    incoming snapshot rounds makes `attach_tx_hashes` skip them AND adds their
+    tx to `already_claimed`, so a transfer assigned to one round on an earlier
+    push can never be re-attached to a different round on a later push (the
+    cross-push duplicate-tx bug). `completed_iso` is the sortable
+    "YYYY-MM-DDTHH:MM:SSZ" form, so LIKE 'YYYY-MM-DD%' selects that UTC day."""
+    out: dict[str, tuple[str, float | None]] = {}
+    with _lock, get_conn() as conn:
+        for r in conn.execute(
+            "SELECT hash, tx_hash, reward_amount FROM rounds "
+            "WHERE node_id = ? AND tx_hash IS NOT NULL AND completed_iso LIKE ?",
+            (node_id, day_prefix + "%"),
+        ):
+            amt = r["reward_amount"]
+            out[r["hash"]] = (r["tx_hash"], float(amt) if amt is not None else None)
+    return out
