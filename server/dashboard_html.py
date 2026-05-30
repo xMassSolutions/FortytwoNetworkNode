@@ -385,6 +385,17 @@ function updatePowerStat(){
   el.textContent = `⚡ ${kw} · ${fmtNum(p[win[0]] || 0)} kWh ${win[1]}`;
 }
 
+// A round that finished within the last ~10 min whose reward hasn't landed
+// on-chain yet shows "pending" rather than a bare dash (which reads as broken).
+function roundPending(hms){
+  const m = /^(\d{2}):(\d{2}):(\d{2})$/.exec(hms || ''); if(!m) return false;
+  const d = new Date();
+  const roundSec = (+m[1])*3600 + (+m[2])*60 + (+m[3]);
+  const nowSec = d.getUTCHours()*3600 + d.getUTCMinutes()*60 + d.getUTCSeconds();
+  let age = nowSec - roundSec; if (age < 0) age += 86400;
+  return age < 600;
+}
+
 // FortyTwo brand colors (orange excluded) for the Today reward-outcome donut.
 const TODAY_COLORS = { rewarded: '#C3F53B', unrewarded: '#2D2BF7', observed: '#8A8A8A' };
 // Reward-outcome doughnut. participated/rewarded come from data.today (the
@@ -405,7 +416,7 @@ function renderToday(data, s){
     return;
   }
   const segs = [
-    ['Rewarded', R, TODAY_COLORS.rewarded],
+    ['Rewarded rounds', R, TODAY_COLORS.rewarded],
     ['Unrewarded', U, TODAY_COLORS.unrewarded],
     ['Observed', O, TODAY_COLORS.observed],
   ].filter(seg => seg[1] > 0);
@@ -590,7 +601,9 @@ async function refresh(){
           // Link goes to monadscan testnet so the user can verify on-chain.
           const txCell = txHash
             ? `<a href="https://testnet.monadscan.com/tx/${txHash}" target="_blank" rel="noopener" style="color:var(--blue);text-decoration:none" title="${txHash}">${txHash.slice(0,12)}…</a>`
-            : '<span style="color:var(--muted)">—</span>';
+            : (roundPending(r.completed_iso)
+                ? '<span style="color:#C3F53B" title="reward not on-chain yet">pending</span>'
+                : '<span style="color:var(--muted)">—</span>');
           return `<tr>`
             + `<td>${r.completed_iso}</td>`
             + `<td>${r.duration_s}s</td>`

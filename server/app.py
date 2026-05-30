@@ -36,7 +36,7 @@ from db import (
     upsert_rounds_history,
 )
 from login_html import LOGIN_HTML
-from rewards import get_tracker, projections as _projections
+from rewards import get_tracker, known_tracker_wallets, projections as _projections
 from store import Snapshot, store
 
 _HEX_ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -51,6 +51,9 @@ AGENT_TOKEN = os.environ["AGENT_TOKEN"]
 WALLET = os.environ["WALLET"]
 FOR_CONTRACT = os.environ.get("FOR_CONTRACT", "0xf6B888f442277F01294F94D555608A2E8Bc86430")
 MONAD_RPC_URL = os.environ.get("MONAD_RPC_URL", "https://testnet-rpc.monad.xyz/")
+# Watts to ADD to each node's reported GPU draw so kW/kWh reflect the whole rig
+# (GPU-only power.draw understates CPU/board/PSU). Operator-set; 0 = GPU only.
+POWER_OVERHEAD_WATTS = float(os.environ.get("POWER_OVERHEAD_WATTS", "0"))
 # FortyTwo public leaderboard (AWS gateway) -- resolves each node's three-word
 # name by operator wallet. Env-overridable in case FortyTwo moves the host.
 FORTYTWO_LEADERBOARD_URL = os.environ.get(
@@ -132,7 +135,7 @@ def _power_summary(node: int) -> dict:
     """{current_kw, kwh_today, kwh_7d, kwh_4w}. current_kw = live GPU draw in kW
     (None if not reported); kWh windows summed from energy_daily (cached)."""
     snap = store.get(node)
-    current_kw = (round(snap.gpu_power_w / 1000.0, 3)
+    current_kw = (round((snap.gpu_power_w + POWER_OVERHEAD_WATTS) / 1000.0, 3)
                   if snap is not None and snap.gpu_power_w else None)
     now = time.time()
     slot = _power_cache.get(node)
@@ -447,7 +450,8 @@ async def _background_uptime_sampler() -> None:
                 if alive and snap is not None and snap.gpu_power_w:
                     try:
                         add_energy(nid, time.strftime("%Y-%m-%d", time.gmtime(now)),
-                                   snap.gpu_power_w * UPTIME_SAMPLE_INTERVAL_SECS / 3.6e6, now)
+                                   (snap.gpu_power_w + POWER_OVERHEAD_WATTS)
+                                   * UPTIME_SAMPLE_INTERVAL_SECS / 3.6e6, now)
                     except Exception as e:  # pragma: no cover -- defensive
                         log.warning("energy accrue failed for node %d: %s", nid, e)
             if (now - last_prune) >= _UPTIME_PRUNE_EVERY_SECS:
@@ -666,6 +670,40 @@ async def v1_status(payload: StatusPayload, authorization: str = Header(None)):
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+
+@app.get("/v1/health")
+async def health_detail():
+    """Read-only health for monitoring (no auth, like /healthz): DB reachable,
+    per-node freshness, and chain-scan status. Exposes only ages/flags."""
+    now = time.time()
+    db_ok = True
+    try:
+        load_round_tx(1, time.strftime("%Y-%m-%d", time.gmtime(now)))
+    except Exception:
+        db_ok = False
+    nodes = []
+    for nid in sorted(set(store.known_node_ids()) | {1}):
+        s = store.get(nid)
+        nodes.append({
+            "node_id": nid,
+            "last_push_age_s": round(now - s.received_at) if s else None,
+            "alive": _is_alive(s, now),
+        })
+    scans = []
+    for w in known_tracker_wallets():
+        t = get_tracker(w)
+        scans.append({
+            "wallet_lc": w,
+            "last_refresh_age_s": round(now - t.last_refresh_ts) if t.last_refresh_ts else None,
+            "error": t.last_error,
+            "pending_rescan": len(t.pending_rescan),
+        })
+    return {
+        "ok": db_ok and any(n["alive"] for n in nodes),
+        "db_ok": db_ok, "nodes": nodes, "scans": scans,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+    }
 
 
 @app.get("/", include_in_schema=False)

@@ -20,6 +20,7 @@ Design:
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +40,11 @@ _TTL_SECONDS = 30.0
 # `413 Request Entity Too Large` on eth_getLogs over wide ranges. 100 blocks
 # is the safe upper bound we've observed. If you point MONAD_RPC_URL at a paid
 # provider (Alchemy, BlockVision, etc.) you can bump this without code changes.
+# Relaxed-pass forward window for tx<->round matching (env-tunable). Rewards
+# that resolve later than this stay unmatched. Default 30 min.
+_RELAXED_PAD_SECONDS = max(60, int(os.environ.get("MATCH_RELAXED_MINUTES", "30")) * 60)
+# Cap on block ranges queued for re-scan after an RPC give-up (bounded memory).
+_MAX_PENDING_RESCAN = 50
 _CHUNK_SIZE = 100
 _MIN_CHUNK_SIZE = 5  # halving floor on retry — below this we skip the chunk
 # Per-request cap when fanning out blockNumber → timestamp lookups
@@ -91,6 +97,9 @@ class RewardsTracker:
     last_scanned_block: int | None = None
     last_refresh_ts: float = 0.0
     last_error: str | None = None
+    # Block ranges [(lo, hi)] skipped on RPC give-up, retried on later refreshes
+    # so their transfers (and earnings) aren't lost permanently.
+    pending_rescan: list = field(default_factory=list)
     _historical_loaded: bool = False  # one-shot guard for lazy load
 
     def _ensure_historical_loaded(self) -> None:
@@ -147,6 +156,7 @@ class RewardsTracker:
         self.today_midnight_block = None
         self.today_transfers = []
         self.last_scanned_block = None
+        self.pending_rescan = []
 
     async def _find_midnight_block(self, rpc_url: str) -> int:
         """Binary-search the first block whose timestamp >= today's UTC midnight.
@@ -224,6 +234,34 @@ class RewardsTracker:
                 attempt_end = cursor + (span // 2) - 1
         return [], cursor - 1, last_err
 
+    async def _ingest_events(self, rpc_url: str, events: list[dict]) -> None:
+        """Annotate raw transfer events with block timestamps and append today's
+        to self.today_transfers. Block-ts lookups are capped per call; over the
+        cap (or on lookup failure) we approximate from the last resolved ts -- a
+        near lower-bound since events arrive ascending by (block, logIndex)."""
+        seen_block_ts: dict[int, int] = {}
+        ts_lookups = 0
+        last_real_ts = self.today_midnight_ts or 0
+        for ev in events:
+            bn = ev["block_number"]
+            if bn not in seen_block_ts:
+                if ts_lookups >= _MAX_BLOCK_TS_LOOKUPS_PER_CHUNK:
+                    seen_block_ts[bn] = last_real_ts
+                else:
+                    try:
+                        real = await get_block_timestamp(rpc_url, bn)
+                        seen_block_ts[bn] = real
+                        last_real_ts = real
+                        ts_lookups += 1
+                    except Exception:
+                        seen_block_ts[bn] = last_real_ts
+            ts = seen_block_ts[bn]
+            if ts < (self.today_midnight_ts or 0):
+                continue
+            self.today_transfers.append(
+                _Transfer(amount=ev["amount"], tx_hash=ev["tx_hash"],
+                          block_number=bn, log_index=ev["log_index"], ts=ts))
+
     async def refresh(self, rpc_url: str, for_contract: str) -> None:
         now = time.time()
         today = _utc_today_str()
@@ -247,9 +285,27 @@ class RewardsTracker:
             latest = await get_latest_block(rpc_url)
             assert self.last_scanned_block is not None
             from_block = self.last_scanned_block + 1
+
+            # Retry ranges we previously skipped on an RPC give-up; recovered
+            # transfers fill back in, ranges that still fail stay queued. Runs
+            # even when caught up (no new blocks) so retries aren't starved.
+            if self.pending_rescan:
+                still: list = []
+                for lo, hi in self.pending_rescan:
+                    ev2, _adv, err2 = await self._fetch_chunk_with_halving(
+                        rpc_url, for_contract, lo, hi)
+                    if ev2:
+                        await self._ingest_events(rpc_url, ev2)
+                    elif err2:
+                        still.append((lo, hi))
+                self.pending_rescan = still
+
             if from_block > latest:
                 self.last_refresh_ts = now
                 self.last_error = None
+                # Recovered rescan transfers (if any) need re-sorting here since
+                # we skip the post-loop sort below.
+                self.today_transfers.sort(key=lambda t: (t.block_number, t.log_index))
                 return
 
             # Chunk to respect eth_getLogs range limits. Each successful chunk
@@ -265,53 +321,19 @@ class RewardsTracker:
                 if err and not events:
                     chunk_err = err
                     if advanced_to >= cursor:
-                        # We gave up on this range — skip past it.
+                        # Gave up on this range -- skip past it for forward
+                        # progress, but queue it for a later re-scan so its
+                        # transfers (and earnings) aren't lost for good.
+                        self.pending_rescan.append((cursor, advanced_to))
+                        if len(self.pending_rescan) > _MAX_PENDING_RESCAN:
+                            self.pending_rescan = self.pending_rescan[-_MAX_PENDING_RESCAN:]
                         self.last_scanned_block = advanced_to
                         cursor = advanced_to + 1
                         continue
-                    # Couldn't make progress at all → bail out for this refresh.
+                    # Couldn't make progress at all -> bail out for this refresh.
                     break
 
-                # Annotate with block timestamp (one extra RPC per unique block,
-                # capped per chunk so a transfer-heavy block range can't blow
-                # out the per-request budget). When the cap is hit or a lookup
-                # fails, approximate from the most recent block timestamp we DID
-                # resolve in this chunk. eth_getLogs returns events ascending by
-                # (block, logIndex), so that value is a near lower-bound (off by
-                # at most ~chunk-span, tens of seconds on Monad) -- close enough
-                # that attach_tx_hashes can still pair the transfer to a round
-                # and transfers_by_hour buckets it into the right hour. Slamming
-                # to midnight (the old fallback) put these at 00:00:00, which is
-                # ~never inside a round's match window and bucketed every capped
-                # transfer into hour 00.
-                seen_block_ts: dict[int, int] = {}
-                ts_lookups = 0
-                last_real_ts = self.today_midnight_ts or 0
-                for ev in events:
-                    bn = ev["block_number"]
-                    if bn not in seen_block_ts:
-                        if ts_lookups >= _MAX_BLOCK_TS_LOOKUPS_PER_CHUNK:
-                            seen_block_ts[bn] = last_real_ts
-                        else:
-                            try:
-                                real = await get_block_timestamp(rpc_url, bn)
-                                seen_block_ts[bn] = real
-                                last_real_ts = real
-                                ts_lookups += 1
-                            except Exception:
-                                seen_block_ts[bn] = last_real_ts
-                    ts = seen_block_ts[bn]
-                    if ts < (self.today_midnight_ts or 0):
-                        continue
-                    self.today_transfers.append(
-                        _Transfer(
-                            amount=ev["amount"],
-                            tx_hash=ev["tx_hash"],
-                            block_number=bn,
-                            log_index=ev["log_index"],
-                            ts=ts,
-                        )
-                    )
+                await self._ingest_events(rpc_url, events)
                 self.last_scanned_block = advanced_to
                 cursor = advanced_to + 1
 
@@ -474,7 +496,8 @@ class RewardsTracker:
         # Backward stays at pad_seconds: a transfer that landed >5 min before a
         # round completed can't be its reward, and widening backward to 30 min
         # is exactly how a later round used to steal an earlier round's tx.
-        _do_pass(pad_seconds, pad_seconds * 6)
+        # Forward reach is env-tunable (MATCH_RELAXED_MINUTES, default 30 min).
+        _do_pass(pad_seconds, _RELAXED_PAD_SECONDS)
 
         # Pass 3 (sequential inter-round gap-fill): a round's reward often only
         # lands on-chain by the time the NEXT round begins -- past the relaxed

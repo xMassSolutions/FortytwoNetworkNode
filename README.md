@@ -307,6 +307,8 @@ Change cadence: set `FORTYTWO_AUTOUPDATE_MINUTES=N` (integer minutes; `0` disabl
 | `ROUNDS_QUERY_MAX` | no | `1000` | Hard cap on `/v1/rounds?limit=…` to keep payloads bounded. |
 | `FOR_CONTRACT` | no | `0xf6B888…6430` | FOR token on Monad Testnet — leave default. |
 | `MONAD_RPC_URL` | no | `https://testnet-rpc.monad.xyz/` | Override if rate-limited. |
+| `MATCH_RELAXED_MINUTES` | no | `30` | How long after a round completes a reward can still be matched to it. Raise if your rewards resolve slowly. |
+| `POWER_OVERHEAD_WATTS` | no | `0` | Watts added to the GPU draw so the kW / kWh stats reflect the whole rig (CPU/board/PSU), not just the GPU. |
 
 ### Agent params
 
