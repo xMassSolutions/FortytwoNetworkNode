@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import bcrypt
+import httpx
 from fastapi import Cookie, Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
@@ -47,6 +48,12 @@ AGENT_TOKEN = os.environ["AGENT_TOKEN"]
 WALLET = os.environ["WALLET"]
 FOR_CONTRACT = os.environ.get("FOR_CONTRACT", "0xf6B888f442277F01294F94D555608A2E8Bc86430")
 MONAD_RPC_URL = os.environ.get("MONAD_RPC_URL", "https://testnet-rpc.monad.xyz/")
+# FortyTwo public leaderboard (AWS gateway) -- resolves each node's three-word
+# name by operator wallet. Env-overridable in case FortyTwo moves the host.
+FORTYTWO_LEADERBOARD_URL = os.environ.get(
+    "FORTYTWO_LEADERBOARD_URL",
+    "https://8vcuob4bv8.execute-api.us-east-2.amazonaws.com/leaderboard_v2",
+)
 
 # --- Dashboard login -------------------------------------------------------
 # Opt-in: when both DASHBOARD_USER and DASHBOARD_PASS_HASH are set, the
@@ -157,6 +164,48 @@ async def _cached_monad_balance(wallet: str) -> tuple[float | None, str | None]:
         slot["error"] = msg
         slot["ts"] = time.time()
         return slot["value"], msg
+
+
+# Node-name cache. FortyTwo assigns each node a stable three-word name; we
+# resolve it from the public leaderboard by operator wallet. Names ~never
+# change, so cache success for hours; cache failures briefly so a flaky fetch
+# can't hammer their API or spam retries. Keyed by lowercased wallet.
+_NODE_NAME_TTL_OK = 6 * 3600.0
+_NODE_NAME_TTL_ERR = 300.0
+_node_name_cache: dict[str, dict] = {}      # wallet_lc → {name, ts, ok}
+
+
+async def _cached_node_name(wallet: str | None) -> str | None:
+    """Resolve a node's FortyTwo three-word name from the public leaderboard,
+    matched by operator wallet (the `participant` field where `original` == the
+    wallet). Cached long on success / short on failure; any error → None so the
+    dashboard falls back to 'Node N'."""
+    if not wallet:
+        return None
+    wlc = wallet.lower()
+    now = time.time()
+    slot = _node_name_cache.get(wlc)
+    if slot and now - slot["ts"] < (_NODE_NAME_TTL_OK if slot["ok"] else _NODE_NAME_TTL_ERR):
+        return slot["name"]
+    try:
+        async with httpx.AsyncClient(timeout=_RPC_REQUEST_TIMEOUT) as client:
+            r = await client.get(
+                FORTYTWO_LEADERBOARD_URL,
+                params={"period": "all_time", "wallet_filter": wlc},
+            )
+            r.raise_for_status()
+            results = (r.json() or {}).get("results") or []
+        name = next(
+            (row.get("participant") for row in results
+             if str(row.get("original", "")).lower() == wlc),
+            (results[0].get("participant") if results else None),
+        ) or None
+        _node_name_cache[wlc] = {"name": name, "ts": now, "ok": True}
+        return name
+    except Exception as e:
+        log.warning("node name fetch failed for %s: %s", wlc, e)
+        _node_name_cache[wlc] = {"name": slot["name"] if slot else None, "ts": now, "ok": False}
+        return slot["name"] if slot else None
 
 
 # Background rewards refresher — runs every _BALANCE_TTL seconds independent
@@ -783,6 +832,7 @@ async def dashboard_data(node: int = 1, _: None = Depends(require_login_json)):
         "chain_rewards": chain_rewards,
         "projections": projections,
         "today": _today_summary(node),
+        "node_name": await _cached_node_name(wallet),
         "uptime": _uptime_for_node(node),
         "wallet": wallet,
         "wallet_short": (f"{wallet[:6]}…{wallet[-4:]}" if wallet else None),

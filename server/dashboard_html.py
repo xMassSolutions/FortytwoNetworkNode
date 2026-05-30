@@ -525,6 +525,12 @@ async function refresh(){
 
   const s = data.snapshot;
   lastSnapshot = s;
+  // Node's real FortyTwo three-word name (server-resolved from the leaderboard
+  // by operator wallet) -- shown in the page title + browser tab ONLY; the node
+  // card keeps its plain "Node" label. Falls back to "Node N" when unknown.
+  const nodeLabel = data.node_name || ('Node ' + NODE_ID);
+  document.title = 'FortyTwo Network: ' + nodeLabel;
+  { const h = document.getElementById('h1-title'); if (h) h.textContent = 'FortyTwo Network: ' + nodeLabel; }
   lastChainRewards = data.chain_rewards || null;
   lastUptime = data.uptime || null;
   document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
