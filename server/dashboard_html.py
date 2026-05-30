@@ -59,6 +59,15 @@ a { color: var(--blue); text-decoration: none; }
 .settings-popup .pop-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
 /* FOR Balance card now also hosts the earnings projection so it's taller. */
 .balance-card { display: flex; flex-direction: column; }
+/* Today card reward-outcome doughnut (FortyTwo brand colors). */
+.donut-wrap { position: relative; width: 100%; max-width: 190px; margin: 4px auto 14px; }
+.donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; }
+.donut-pct { font-size: 28px; font-weight: 700; color: var(--text); line-height: 1; }
+.donut-cap { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-top: 3px; }
+.donut-legend { display: flex; flex-direction: column; gap: 7px; font-size: 13px; }
+.lg-item { display: flex; align-items: center; gap: 8px; }
+.lg-dot { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+.lg-val { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
 .projection-section { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 14px; }
 .projection-section::before { content: 'Earnings projection'; display: block; font-size: 10px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.5px; font-weight: 600; margin-bottom: 10px; }
 </style>
@@ -102,7 +111,15 @@ a { color: var(--blue); text-decoration: none; }
       </div>
       <div id="node-content">…</div>
     </div>
-    <div class="card"><h2>Today (UTC)</h2><div id="today-content">…</div></div>
+    <div class="card"><h2>Today (UTC)</h2>
+      <div id="today-content">
+        <div class="donut-wrap">
+          <canvas id="today-donut"></canvas>
+          <div id="today-center" class="donut-center"></div>
+        </div>
+        <div id="today-legend" class="donut-legend"></div>
+      </div>
+    </div>
   </div>
   <div class="chart-wrap has-settings">
     <div class="section-header">
@@ -192,6 +209,7 @@ const NODE_ID = parseInt(location.pathname.split('/').filter(Boolean).pop()) || 
 document.title = 'FortyTwo Network: Node ' + NODE_ID;
 (function(){ const h = document.getElementById('h1-title'); if (h) h.textContent = 'FortyTwo Network: Node ' + NODE_ID; })();
 let chart;
+let todayChart;
 // Per-node localStorage prefs so switching nodes carries its own settings.
 // Wrapped in try/catch -- Safari private mode and disabled-storage browsers
 // throw on access. Fall back to the supplied default silently.
@@ -353,6 +371,53 @@ function updateChart(history, forByHour){
   }
 }
 
+// FortyTwo brand colors (orange excluded) for the Today reward-outcome donut.
+const TODAY_COLORS = { rewarded: '#C3F53B', unrewarded: '#2D2BF7', observed: '#8A8A8A' };
+// Reward-outcome doughnut. participated/rewarded come from data.today (the
+// durable Neon rounds table, so it renders even on a cold start when the live
+// snapshot `s` is null); observed-only comes from the live snapshot.
+function renderToday(data, s){
+  const t = data.today || null;
+  const P = (t && t.participated != null) ? t.participated : (s ? (s.rounds_participated_today || 0) : 0);
+  const R = (t && t.rewarded != null) ? t.rewarded : 0;
+  const U = Math.max(0, P - R);
+  const O = s ? Math.max(0, (s.rounds_observed_today || 0) - (s.rounds_participated_today || 0)) : 0;
+  const center = document.getElementById('today-center');
+  const legend = document.getElementById('today-legend');
+  if (P === 0 && O === 0){
+    if (todayChart){ todayChart.destroy(); todayChart = null; }
+    center.innerHTML = '';
+    legend.innerHTML = '<div style="color:var(--muted);font-size:13px;text-align:center">No rounds today yet</div>';
+    return;
+  }
+  const segs = [
+    ['Rewarded', R, TODAY_COLORS.rewarded],
+    ['Unrewarded', U, TODAY_COLORS.unrewarded],
+    ['Observed', O, TODAY_COLORS.observed],
+  ].filter(seg => seg[1] > 0);
+  const labels = segs.map(x => x[0]), vals = segs.map(x => x[1]), cols = segs.map(x => x[2]);
+  const ctx = document.getElementById('today-donut').getContext('2d');
+  if (!todayChart){
+    todayChart = new Chart(ctx, {
+      type: 'doughnut',
+      data: { labels, datasets: [{ data: vals, backgroundColor: cols, borderColor: '#141414', borderWidth: 2 }] },
+      options: { responsive: true, maintainAspectRatio: true, aspectRatio: 1, cutout: '68%',
+        plugins: { legend: { display: false },
+          tooltip: { callbacks: { label: c => `${c.label}: ${fmtNum(c.parsed)}` } } } }
+    });
+  } else {
+    todayChart.data.labels = labels;
+    todayChart.data.datasets[0].data = vals;
+    todayChart.data.datasets[0].backgroundColor = cols;
+    todayChart.update('none');
+  }
+  const pct = P ? Math.round(100 * R / P) : 0;
+  center.innerHTML = `<div class="donut-pct">${pct}%</div><div class="donut-cap">rewarded</div>`;
+  legend.innerHTML = segs.map(([lab, val, col]) =>
+    `<div class="lg-item"><span class="lg-dot" style="background:${col}"></span>${lab}<span class="lg-val">${fmtNum(val)}</span></div>`
+  ).join('');
+}
+
 function updateLog(s){
   const pre = document.getElementById('log-view');
   if (!s) { pre.textContent = '(no data)'; return; }
@@ -490,29 +555,9 @@ async function refresh(){
 
   if(!s){
     renderNodeCard(null, lastUptime);
-    document.getElementById('today-content').innerHTML = row('Status','—');
     document.getElementById('rounds-body').innerHTML = '<tr><td colspan="3" style="color:var(--muted);text-align:center">No data</td></tr>';
   } else {
     renderNodeCard(s, lastUptime);
-
-    const participated = s.rounds_participated_today || 0;
-    // wins_today now mirrors participations on the agent side. rewards_logged_today
-    // = positive-delta balance pairs (rewards captured in the Capsule's ~7-sec
-    // snapshot window). Shown as a diagnostic for how many rewards were caught
-    // in-window — the chain_rewards.transfers_today on the FOR card is the
-    // authoritative total.
-    const loggedRewards = s.rewards_logged_today || 0;
-    const loggedRow = participated > 0
-      ? row('Rewarded (log)', `<span style="color:var(--muted)">${loggedRewards} / ${participated} in-snapshot</span>`)
-      : '';
-
-    document.getElementById('today-content').innerHTML =
-        row('Participated', `<strong style="font-size:18px">${participated}</strong>`)
-      + row('Observed', s.rounds_observed_today)
-      + row('Errors', s.errors_today)
-      + loggedRow
-      + row('First round', s.first_round_today_iso||'—')
-      + row('Last round', `${s.last_round_today_iso||'—'} <span style="color:var(--muted)">${s.last_round_duration_s?s.last_round_duration_s+'s':''}</span>`);
 
     const recent = s.recent_rounds || [];
     document.getElementById('rounds-body').innerHTML = recent.length
@@ -534,6 +579,10 @@ async function refresh(){
         }).join('')
       : '<tr><td colspan="4" style="color:var(--muted);text-align:center">No rounds today</td></tr>';
   }
+
+  // Today doughnut: participated/rewarded from Neon (data.today, DB-backed so
+  // it survives cold starts); observed-only from the live snapshot.
+  renderToday(data, s);
 
   if(data.balance!=null){
     // Earned today + last reward: prefer chain-derived (authoritative for

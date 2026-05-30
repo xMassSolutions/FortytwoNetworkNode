@@ -27,6 +27,7 @@ from db import (
     load_rounds_history,
     load_uptime_samples_since,
     prune_uptime_samples_older_than,
+    today_round_summary,
     upsert_rounds,
     upsert_rounds_history,
 )
@@ -86,6 +87,29 @@ _login_failures: dict[str, deque] = {}
 _BALANCE_TTL = 30.0
 _balance_cache: dict[str, dict] = {}        # wallet_lc → {value, error, ts}
 _monad_balance_cache: dict[str, dict] = {}
+
+# Today-card summary cache. The "Today" doughnut reads authoritative
+# participated/rewarded counts from the durable rounds table; cache per node so
+# the 5s dashboard poll doesn't hit Postgres on every request.
+_TODAY_TTL = 30.0
+_today_cache: dict[int, dict] = {}          # node_id → {data, ts}
+
+
+def _today_summary(node: int) -> dict | None:
+    """Cached authoritative {participated, rewarded} for the node's Today
+    doughnut (~30s TTL). On DB error returns the last good value, else None."""
+    now = time.time()
+    slot = _today_cache.get(node)
+    if slot and now - slot["ts"] < _TODAY_TTL:
+        return slot["data"]
+    try:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        data = today_round_summary(node, day)
+    except Exception as e:
+        log.warning("today summary failed for node %d: %s", node, e)
+        return slot["data"] if slot else None
+    _today_cache[node] = {"data": data, "ts": now}
+    return data
 
 
 # Hard per-request RPC ceiling. The cache absorbs sustained traffic; this just
@@ -758,6 +782,7 @@ async def dashboard_data(node: int = 1, _: None = Depends(require_login_json)):
         "monad_balance_error": monad_balance_error,
         "chain_rewards": chain_rewards,
         "projections": projections,
+        "today": _today_summary(node),
         "uptime": _uptime_for_node(node),
         "wallet": wallet,
         "wallet_short": (f"{wallet[:6]}…{wallet[-4:]}" if wallet else None),

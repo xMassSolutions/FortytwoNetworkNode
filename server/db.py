@@ -436,3 +436,26 @@ def load_round_tx(node_id: int, day_prefix: str) -> dict[str, tuple[str, float |
             amt = r["reward_amount"]
             out[r["hash"]] = (r["tx_hash"], float(amt) if amt is not None else None)
     return out
+
+
+def today_round_summary(node_id: int, day_prefix: str) -> dict[str, int]:
+    """Authoritative counts for the dashboard "Today" doughnut, from the durable
+    rounds table (so the card survives Render cold starts). `day_prefix` is a
+    "YYYY-MM-DD" string; completed_iso is the sortable "YYYY-MM-DDTHH:MM:SSZ"
+    form, so LIKE 'YYYY-MM-DD%' selects that UTC day.
+
+    Returns {participated, rewarded}, where `rewarded` = distinct on-chain tx
+    among participated rounds. COUNT(DISTINCT ...) collapses any duplicate rows,
+    so the figure is correct regardless of the dedup state. No FILTER clause --
+    CASE keeps it portable across SQLite and Postgres."""
+    with _lock, get_conn() as conn:
+        row = conn.execute(
+            "SELECT sum(CASE WHEN participated=1 THEN 1 ELSE 0 END) AS participated, "
+            "       count(DISTINCT CASE WHEN participated=1 THEN tx_hash END) AS rewarded "
+            "FROM rounds WHERE node_id = ? AND completed_iso LIKE ?",
+            (node_id, day_prefix + "%"),
+        ).fetchone()
+    return {
+        "participated": int(row["participated"] or 0) if row else 0,
+        "rewarded": int(row["rewarded"] or 0) if row else 0,
+    }
