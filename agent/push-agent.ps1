@@ -24,6 +24,12 @@ if (-not $DryRun) {
 
 $ExtLog          = Join-Path $ScriptsRoot "extended_log.txt"
 $CapsuleLog      = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.log"
+# Capsule log filename differs by platform: Windows writes FortytwoCapsule.log;
+# macOS/Linux write FortytwoCapsule.logs. Prefer whichever exists (.log first).
+if (-not (Test-Path $CapsuleLog)) {
+    $CapsuleLogAlt = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.logs"
+    if (Test-Path $CapsuleLogAlt) { $CapsuleLog = $CapsuleLogAlt }
+}
 $ReadyUrl        = "http://localhost:42442/ready"
 $RoundsHistoryFile = Join-Path $PSScriptRoot "rounds-history.json"
 # Repo root: this script lives in <repo>/agent/, so parent of $PSScriptRoot is the repo.
@@ -569,7 +575,7 @@ function Get-NodeSnapshot {
     }
     # Protocol writes version banner at extended_log.txt startup; pattern observed in logs
     if (Test-Path $ExtLog) {
-        $pvLine = Select-String -Path $ExtLog -Pattern "(?:Protocol version|protocol.+version)[:\s]+v?(\d+\.\d+\.\d+)" | Select-Object -Last 1
+        $pvLine = Select-String -Path $ExtLog -Pattern "Protocol(?:\s+Node)?(?:\s+current)?\s+version[:\s]+v?(\d+\.\d+\.\d+)" | Select-Object -Last 1
         if ($pvLine) { $protocolVersion = $pvLine.Matches[0].Groups[1].Value }
     }
 

@@ -34,3 +34,29 @@ def test_round_and_decided_hash_match():
     decided = f"UTC 2026-05-29 16:15:27 INFO Capsule has decided to participate in inference request {h}"
     assert pa.ROUND_DETAIL_RE.search(completed).group(4) == h
     assert pa.DECIDED_HASH_RE.search(decided).group(1) == h
+
+
+def test_resolve_capsule_log_prefers_logs_on_mac(tmp_path):
+    # macOS/Linux installers write FortytwoCapsule.logs (plural) -- the bug that
+    # nulled model/version on Mac because the agent only looked for .log.
+    debug = tmp_path / "FortytwoNode" / "debug"
+    debug.mkdir(parents=True)
+    (debug / "FortytwoCapsule.logs").write_text("x")
+    assert pa.resolve_capsule_log(tmp_path).name == "FortytwoCapsule.logs"
+
+
+def test_resolve_capsule_log_prefers_log_when_both_exist(tmp_path):
+    # Windows writes .log; if both somehow exist, .log wins (back-compat).
+    debug = tmp_path / "FortytwoNode" / "debug"
+    debug.mkdir(parents=True)
+    (debug / "FortytwoCapsule.log").write_text("x")
+    (debug / "FortytwoCapsule.logs").write_text("x")
+    assert pa.resolve_capsule_log(tmp_path).name == "FortytwoCapsule.log"
+
+
+def test_protocol_version_regex_matches_current_format():
+    # Real line on a live node: "Fortytwo Protocol Node current version: 0.25.1".
+    # The old regex was case-sensitive in Python and missed it on macOS/Linux.
+    line = "UTC 2026-05-31 19:23:53 INFO Fortytwo Protocol Node current version: 0.25.1"
+    m = pa.PROTOCOL_VERSION_RE.search(line)
+    assert m and m.group(1) == "0.25.1"

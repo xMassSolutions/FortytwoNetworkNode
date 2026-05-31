@@ -300,7 +300,7 @@ MODEL_LOCAL_RE = re.compile(r"Using local LLM model: (.+)$")
 MODEL_HF_RE = re.compile(r"(?:--llm-hf-model-name\s+|LLM model name\s+)(\S+\.gguf)")
 CAPSULE_VERSION_RE = re.compile(r"Fortytwo Capsule current version: (\S+)")
 PROTOCOL_VERSION_RE = re.compile(
-    r"(?:Protocol version|protocol.+version)[:\s]+v?(\d+\.\d+\.\d+)"
+    r"(?i)Protocol(?:\s+Node)?(?:\s+current)?\s+version[:\s]+v?(\d+\.\d+\.\d+)"
 )
 RECEIPT_HASH_RE = re.compile(r"receipt hash (0x[0-9a-fA-F]+)")
 
@@ -314,6 +314,20 @@ def read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def resolve_capsule_log(scripts_root: Path) -> Path:
+    """Path to the Capsule log. The filename differs by platform: Windows writes
+    FortytwoCapsule.log; macOS/Linux write FortytwoCapsule.logs. Prefer whichever
+    exists (.log first, for Windows back-compat). Resolved per snapshot so it
+    picks up the file once the node starts."""
+    debug = scripts_root / "FortytwoNode" / "debug"
+    log = debug / "FortytwoCapsule.log"
+    if not log.exists():
+        alt = debug / "FortytwoCapsule.logs"
+        if alt.exists():
+            return alt
+    return log
 
 
 # ---------- process detection (macOS + Linux) ----------
@@ -458,7 +472,7 @@ def get_node_snapshot(
     docker_container: str | None = None,
 ) -> dict[str, Any]:
     ext_log = scripts_root / "extended_log.txt"
-    capsule_log = scripts_root / "FortytwoNode" / "debug" / "FortytwoCapsule.log"
+    capsule_log = resolve_capsule_log(scripts_root)
     today_utc = utc_today_str()
 
     ext_content = read_text(ext_log)
