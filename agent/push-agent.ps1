@@ -2,8 +2,11 @@ param(
     [string]$BotUrl = $env:FORTYTWO_BOT_URL,
     [string]$AgentToken = $env:FORTYTWO_AGENT_TOKEN,
     [int]$IntervalSeconds = 30,
-    [Parameter(Mandatory=$true)]
-    [string]$ScriptsRoot,
+    # Path to a single node's scripts-root. OPTIONAL: when omitted the agent
+    # runs in auto-discovery mode and reports EVERY FortyTwo node on this
+    # machine (one agent per PC). Pass it to pin to one node (legacy
+    # single-node mode; also required for -DockerContainer nodes).
+    [string]$ScriptsRoot = $env:FORTYTWO_SCRIPTS_ROOT,
     [string]$DockerContainer = $env:FORTYTWO_DOCKER_CONTAINER,
     # Numeric node identifier sent in every push. Lets one dashboard serve N
     # nodes (each on /dashboard/<NodeId>). Defaults to 1 so an unconfigured
@@ -22,16 +25,24 @@ if (-not $DryRun) {
     if (-not $AgentToken) { throw "FORTYTWO_AGENT_TOKEN env not set (or pass -AgentToken, or use -DryRun)" }
 }
 
-$ExtLog          = Join-Path $ScriptsRoot "extended_log.txt"
-$CapsuleLog      = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.log"
-# Capsule log filename differs by platform: Windows writes FortytwoCapsule.log;
-# macOS/Linux write FortytwoCapsule.logs. Prefer whichever exists (.log first).
-if (-not (Test-Path $CapsuleLog)) {
-    $CapsuleLogAlt = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.logs"
-    if (Test-Path $CapsuleLogAlt) { $CapsuleLog = $CapsuleLogAlt }
+# These script-scope paths back the LEGACY single-node mode (and serve as the
+# default values for Get-NodeSnapshot's params). In auto-discovery mode they go
+# unused -- the discovery loop passes per-node paths explicitly. Only compute
+# the ScriptsRoot-derived paths when a ScriptsRoot was given.
+if ($ScriptsRoot) {
+    $ExtLog     = Join-Path $ScriptsRoot "extended_log.txt"
+    $CapsuleLog = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.log"
+    # Capsule log filename differs by platform: Windows writes FortytwoCapsule.log;
+    # macOS/Linux write FortytwoCapsule.logs. Prefer whichever exists (.log first).
+    if (-not (Test-Path $CapsuleLog)) {
+        $CapsuleLogAlt = Join-Path $ScriptsRoot "FortytwoNode\debug\FortytwoCapsule.logs"
+        if (Test-Path $CapsuleLogAlt) { $CapsuleLog = $CapsuleLogAlt }
+    }
 }
-$ReadyUrl        = "http://localhost:42442/ready"
+$ReadyUrl          = "http://localhost:42442/ready"
 $RoundsHistoryFile = Join-Path $PSScriptRoot "rounds-history.json"
+# Persistent wallet -> node_id map (shared JSON format with the Python agent).
+$NodeMapFile       = Join-Path $PSScriptRoot "discovered-nodes.json"
 # Repo root: this script lives in <repo>/agent/, so parent of $PSScriptRoot is the repo.
 # Used by the auto-update cycle to run git from the correct working dir.
 $RepoRoot = Split-Path $PSScriptRoot -Parent
@@ -242,7 +253,125 @@ function Get-GpuInfo {
     return @{ name = $gpuName; used = $vramUsed; total = $vramTotal; power_w = $powerW }
 }
 
+# ---------- node auto-discovery ----------
+# One agent per machine: enumerate every FortytwoCapsule.exe, resolve each
+# node's scripts-root (ExecutablePath two levels up), wallet (from that root's
+# extended_log.txt) and ready port (from its Capsule log). We never read the
+# private key; only logs + process metadata.
+
+function Get-OperatorWallet([string]$extLogPath) {
+    if (-not $extLogPath -or -not (Test-Path $extLogPath)) { return $null }
+    $m = Select-String -Path $extLogPath -Pattern 'Operator Wallet Address:\s*(0x[0-9a-fA-F]{40})' |
+        Select-Object -Last 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return $null
+}
+
+function Resolve-CapsuleLogForRoot([string]$root) {
+    $log = Join-Path $root "FortytwoNode\debug\FortytwoCapsule.log"
+    if (-not (Test-Path $log)) {
+        $alt = Join-Path $root "FortytwoNode\debug\FortytwoCapsule.logs"
+        if (Test-Path $alt) { return $alt }
+    }
+    return $log
+}
+
+function Resolve-ReadyUrl([string]$capsuleLogPath) {
+    # Port from the Capsule log's "Server running at http://<host>:<port>" line
+    # (last match). Always probe 127.0.0.1 (the log may say 0.0.0.0). Fallback 42442.
+    $port = 42442
+    if ($capsuleLogPath -and (Test-Path $capsuleLogPath)) {
+        $m = Select-String -Path $capsuleLogPath -Pattern 'Server running at https?://[^:/\s]+:(\d+)' |
+            Select-Object -Last 1
+        if ($m) { $port = [int]$m.Matches[0].Groups[1].Value }
+    }
+    return "http://127.0.0.1:$port/ready"
+}
+
+function Get-NodeIdForWallet([string]$wallet) {
+    # Stable wallet -> node_id from discovered-nodes.json: reuse existing id,
+    # else hand out the lowest unused positive integer and persist.
+    $key = $wallet.ToLower()
+    $map = @{}
+    if (Test-Path $NodeMapFile) {
+        try {
+            $obj = Get-Content $NodeMapFile -Raw | ConvertFrom-Json
+            foreach ($p in $obj.PSObject.Properties) { $map[$p.Name.ToLower()] = [int]$p.Value }
+        } catch { $map = @{} }
+    }
+    if ($map.ContainsKey($key)) { return $map[$key] }
+    $used = @($map.Values)
+    $nid = 1
+    while ($used -contains $nid) { $nid++ }
+    $map[$key] = $nid
+    try {
+        $out = [ordered]@{}
+        foreach ($k in $map.Keys) { $out[$k] = $map[$k] }
+        ($out | ConvertTo-Json) | Set-Content -Path $NodeMapFile -Encoding ASCII
+    } catch { }
+    return $nid
+}
+
+function Get-ProtocolPidForRoot([string]$root) {
+    # The FortytwoProtocol.exe whose scripts-root (ExecutablePath two levels up)
+    # matches this node. Lets a multi-node host report each node's OWN protocol.
+    $protos = Get-CimInstance Win32_Process -Filter "Name = 'FortytwoProtocol.exe'" -ErrorAction SilentlyContinue
+    foreach ($p in $protos) {
+        if (-not $p.ExecutablePath) { continue }
+        $pr = Split-Path (Split-Path $p.ExecutablePath -Parent) -Parent
+        if ($pr -eq $root) { return $p.ProcessId }
+    }
+    return 0
+}
+
+function Get-DiscoveredNodes {
+    $nodes = @()
+    $seen = @{}
+    $caps = Get-CimInstance Win32_Process -Filter "Name = 'FortytwoCapsule.exe'" -ErrorAction SilentlyContinue
+    foreach ($c in $caps) {
+        $exe = $c.ExecutablePath
+        if (-not $exe) { continue }
+        # <scripts-root>\FortytwoNode\FortytwoCapsule.exe -> root is two levels up.
+        $root = Split-Path (Split-Path $exe -Parent) -Parent
+        if (-not $root -or $seen.ContainsKey($root)) { continue }
+        $seen[$root] = $true
+        $extLog = Join-Path $root "extended_log.txt"
+        $wallet = Get-OperatorWallet $extLog
+        if (-not $wallet) {
+            Write-Output ("[discover] capsule pid={0} root={1} has no 'Operator Wallet Address' yet - skipping" -f $c.ProcessId, $root)
+            continue
+        }
+        $capLog = Resolve-CapsuleLogForRoot $root
+        $nodes += [pscustomobject]@{
+            ScriptsRoot = $root
+            ExtLog      = $extLog
+            CapsuleLog  = $capLog
+            ReadyUrl    = (Resolve-ReadyUrl $capLog)
+            NodeId      = (Get-NodeIdForWallet $wallet)
+            NodeWallet  = $wallet
+            CapsulePid  = $c.ProcessId
+            ProtocolPid = (Get-ProtocolPidForRoot $root)
+        }
+    }
+    return ,$nodes
+}
+
 function Get-NodeSnapshot {
+    param(
+        [string]$ScriptsRoot       = $script:ScriptsRoot,
+        [string]$ExtLog            = $script:ExtLog,
+        [string]$CapsuleLog        = $script:CapsuleLog,
+        [string]$ReadyUrl          = $script:ReadyUrl,
+        [int]$NodeId               = $script:NodeId,
+        [string]$NodeWallet        = $script:NodeWallet,
+        [string]$DockerContainer   = $script:DockerContainer,
+        [string]$RoundsHistoryFile = $script:RoundsHistoryFile,
+        # Auto-discovery passes this node's OWN pids (scoped by ExecutablePath)
+        # so a multi-node host never reports the same pid for every node. Null
+        # in legacy single-node mode -> fall back to a global first-match.
+        [int]$CapsulePid           = 0,
+        [int]$ProtocolPid          = 0
+    )
     $todayUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
 
     $todayLines = @()
@@ -556,6 +685,15 @@ function Get-NodeSnapshot {
         $protoPid         = $dockerInfo.protocolPid
         $capUptime        = $dockerInfo.uptimeSeconds   # container uptime (proxy for capsule uptime)
         $dockerProtoAlive = $dockerInfo.protocolAlive
+    } elseif ($CapsulePid -gt 0 -or $ProtocolPid -gt 0) {
+        # Auto-discovery: use THIS node's own pids (scoped by ExecutablePath).
+        $capPid   = if ($CapsulePid  -gt 0) { $CapsulePid }  else { $null }
+        $protoPid = if ($ProtocolPid -gt 0) { $ProtocolPid } else { $null }
+        if ($capPid) {
+            $cp = Get-Process -Id $capPid -ErrorAction SilentlyContinue
+            if ($cp -and $cp.StartTime) { $capUptime = [int]((Get-Date) - $cp.StartTime).TotalSeconds }
+        }
+        $dockerProtoAlive = [bool]$protoPid
     } else {
         $cap   = Get-Process FortytwoCapsule  -ErrorAction SilentlyContinue | Select-Object -First 1
         $proto = Get-Process FortytwoProtocol -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -661,14 +799,36 @@ function Post-Snapshot($snap) {
     }
 }
 
+# No -ScriptsRoot (and no FORTYTWO_SCRIPTS_ROOT) => auto-discovery mode.
+$AutoMode = -not $ScriptsRoot
+
+# Build a per-node snapshot in auto mode (per-node paths + a per-node rounds
+# history file so multi-node hourly counts never cross-contaminate).
+function Get-AutoNodeSnapshot($n) {
+    $hist = Join-Path $PSScriptRoot ("rounds-history-{0}.json" -f $n.NodeId)
+    return Get-NodeSnapshot -ScriptsRoot $n.ScriptsRoot -ExtLog $n.ExtLog `
+        -CapsuleLog $n.CapsuleLog -ReadyUrl $n.ReadyUrl -NodeId $n.NodeId `
+        -NodeWallet $n.NodeWallet -RoundsHistoryFile $hist `
+        -CapsulePid $n.CapsulePid -ProtocolPid $n.ProtocolPid
+}
+
 if ($DryRun) {
-    $snap = Get-NodeSnapshot
-    $snap | ConvertTo-Json -Depth 6
+    if ($AutoMode) {
+        $out = @()
+        foreach ($n in (Get-DiscoveredNodes)) { $out += (Get-AutoNodeSnapshot $n) }
+        $out | ConvertTo-Json -Depth 6
+    } else {
+        (Get-NodeSnapshot) | ConvertTo-Json -Depth 6
+    }
     return
 }
 
 if ($Once) {
-    Post-Snapshot (Get-NodeSnapshot)
+    if ($AutoMode) {
+        foreach ($n in (Get-DiscoveredNodes)) { Post-Snapshot (Get-AutoNodeSnapshot $n) }
+    } else {
+        Post-Snapshot (Get-NodeSnapshot)
+    }
     return
 }
 
@@ -677,6 +837,59 @@ $PollIntervalSeconds = 5
 $EventPattern = "Completed inference participation|Inference round \w+ completed.*Total time"
 
 $autoUpdateBanner = if ($AutoUpdateMinutes -gt 0) { "auto-update every ${AutoUpdateMinutes}m" } else { "auto-update disabled" }
+
+# ---------- auto-discovery loop (one agent per machine) ----------
+# Interval-based: every cycle re-discover all local nodes and push one snapshot
+# per node (handles node up/down automatically). The per-line event-tailing
+# optimization below is for legacy single-node mode only.
+if ($AutoMode) {
+    $PushInterval = 30
+    Write-Output "Fortytwo agent starting. Mode: auto-discovery (one agent per machine), ${PushInterval}s push interval, $autoUpdateBanner. Bot URL: $BotUrl"
+    $lastUpdateCheck = Get-Date
+    $lastLoopError = $null
+    $loopErrorSuppressed = 0
+    while ($true) {
+        $cycleStart = Get-Date
+        try {
+            $nodes = Get-DiscoveredNodes
+            if (-not $nodes -or @($nodes).Count -eq 0) {
+                Write-Output ("[{0}] no FortyTwo nodes discovered" -f (Get-Date -Format "HH:mm:ss"))
+            }
+            foreach ($n in $nodes) {
+                try {
+                    Post-Snapshot (Get-AutoNodeSnapshot $n)
+                } catch {
+                    Write-Output ("[{0}] [node {1}] push failed: {2}" -f (Get-Date -Format "HH:mm:ss"), $n.NodeId, $_.Exception.Message)
+                }
+            }
+            if ($AutoUpdateMinutes -gt 0 -and ((Get-Date) - $lastUpdateCheck).TotalMinutes -ge $AutoUpdateMinutes) {
+                Invoke-AutoUpdateCheck
+                $lastUpdateCheck = Get-Date
+            }
+            if ($lastLoopError) {
+                $now = Get-Date -Format "HH:mm:ss"
+                Write-Output ("[$now] LOOP RECOVERED after {0} suppressed similar errors. Last: {1}" -f $loopErrorSuppressed, $lastLoopError)
+                $lastLoopError = $null
+                $loopErrorSuppressed = 0
+            }
+        } catch {
+            $msg = "{0}: {1}" -f $_.Exception.GetType().Name, $_.Exception.Message
+            if ($msg -eq $lastLoopError) {
+                $loopErrorSuppressed += 1
+            } else {
+                $now = Get-Date -Format "HH:mm:ss"
+                Write-Output ("[$now] LOOP ERROR (continuing): $msg")
+                $lastLoopError = $msg
+                $loopErrorSuppressed = 0
+            }
+        }
+        $elapsed = ((Get-Date) - $cycleStart).TotalSeconds
+        $sleep = [Math]::Max(1, $PushInterval - $elapsed)
+        Start-Sleep -Seconds $sleep
+    }
+    return
+}
+
 Write-Output "Fortytwo agent starting. Mode: event-driven + ${HeartbeatSeconds}s heartbeat, $autoUpdateBanner. Bot URL: $BotUrl"
 
 # Bootstrap push so the bot has fresh data immediately on agent start

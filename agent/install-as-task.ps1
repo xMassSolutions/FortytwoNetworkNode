@@ -1,20 +1,24 @@
 param(
     [Parameter(Mandatory)] [string]$BotUrl,
     [Parameter(Mandatory)] [string]$AgentToken,
-    [Parameter(Mandatory)] [string]$ScriptsRoot,
+    # OPTIONAL: omit for auto-discovery -- ONE agent reports every FortyTwo node
+    # on this PC (recommended). Pass a path to pin the agent to a single node
+    # (legacy mode; also required for a -DockerContainer node).
+    [string]$ScriptsRoot = "",
     [string]$DockerContainer = "",
-    # Numeric node identifier -- surfaces in the dashboard URL (/dashboard/<id>)
-    # and lets one server show multiple nodes side-by-side.
+    # Legacy single-node knobs (ignored in auto mode -- ids are auto-assigned).
     [int]$NodeId = 1,
-    # Operator wallet for THIS node. Leave empty to inherit the server's WALLET
-    # env var (back-compat). Required when multiple nodes use different wallets.
     [string]$NodeWallet = "",
-    # Per-node task name so two nodes can be installed on the same Windows box
-    # without colliding. Defaults to "FortytwoBotAgent-Node<N>".
+    # Task name. Defaults to "FortytwoBotAgent" in auto mode, or
+    # "FortytwoBotAgent-Node<N>" for a pinned single-node install.
     [string]$TaskName = ""
 )
 
-if (-not $TaskName) { $TaskName = "FortytwoBotAgent-Node$NodeId" }
+# No -ScriptsRoot => auto-discovery (one agent per machine).
+$AutoMode = -not $ScriptsRoot
+if (-not $TaskName) {
+    $TaskName = if ($AutoMode) { "FortytwoBotAgent" } else { "FortytwoBotAgent-Node$NodeId" }
+}
 
 $here   = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script = Join-Path $here "push-agent.ps1"
@@ -24,19 +28,27 @@ if (-not (Test-Path $script)) { throw "push-agent.ps1 not found at $script" }
 $wrapper = Join-Path $here "_agent-wrapper.ps1"
 $logFile = Join-Path $here "agent.log"
 
-$dockerArg = if ($DockerContainer) { "-DockerContainer '$DockerContainer' " } else { "" }
-# Only emit FORTYTWO_NODE_WALLET when provided -- an empty value would fail the
-# server's hex-address validator on every push. Missing field -> server falls
-# back to its WALLET env var.
-$nodeWalletLine = if ($NodeWallet) { "`$env:FORTYTWO_NODE_WALLET = '$NodeWallet'`r`n" } else { "" }
+# In auto mode the wrapper passes no per-node flags -- the agent discovers every
+# node and assigns stable ids itself. In legacy mode it pins to one ScriptsRoot.
+if ($AutoMode) {
+    $envLines = ""
+    $invoke   = "& '$script' *>> '$logFile'"
+} else {
+    $dockerArg = if ($DockerContainer) { "-DockerContainer '$DockerContainer' " } else { "" }
+    # Only emit FORTYTWO_NODE_WALLET when provided -- an empty value would fail
+    # the server's hex-address validator on every push.
+    $nodeWalletLine = if ($NodeWallet) { "`$env:FORTYTWO_NODE_WALLET = '$NodeWallet'`r`n" } else { "" }
+    $envLines = "`$env:FORTYTWO_NODE_ID = '$NodeId'`r`n$nodeWalletLine"
+    $invoke   = "& '$script' -ScriptsRoot '$ScriptsRoot' $dockerArg*>> '$logFile'"
+}
+
 $wrapperContent = @"
 `$env:FORTYTWO_BOT_URL = '$BotUrl'
 `$env:FORTYTWO_AGENT_TOKEN = '$AgentToken'
-`$env:FORTYTWO_NODE_ID = '$NodeId'
-$nodeWalletLine
+$envLines
 while (`$true) {
     try {
-        & '$script' -ScriptsRoot '$ScriptsRoot' $dockerArg*>> '$logFile'
+        $invoke
     } catch {
         ('agent died: ' + `$_.Exception.Message + ' - restarting in 10s') | Out-File -FilePath '$logFile' -Append
         Start-Sleep -Seconds 10
@@ -56,7 +68,8 @@ $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
 
-Write-Output "Scheduled Task '$TaskName' installed."
+$modeDesc = if ($AutoMode) { "auto-discovery (every local node)" } else { "single node: $ScriptsRoot" }
+Write-Output "Scheduled Task '$TaskName' installed -- mode: $modeDesc."
 Write-Output "Wrapper: $wrapper"
 Write-Output "Logs:    $logFile"
 Write-Output ""

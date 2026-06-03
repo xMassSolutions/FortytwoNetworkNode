@@ -2,35 +2,36 @@
 # Install the FortytwoBot agent as a systemd --user service on Linux.
 #
 # Usage:
-#   ./install-linux.sh <bot-url> <agent-token> <scripts-root> [docker-container]
+#   ./install-linux.sh <bot-url> <agent-token> [scripts-root] [docker-container]
+#
+# ONE agent per machine. With no <scripts-root> the agent runs in
+# auto-discovery mode: it finds every FortyTwo node on this host and reports
+# each one. Pass <scripts-root> only to pin the agent to a single node (legacy
+# mode; also required for a Docker-container node, given as the 4th arg).
 #
 # After install, the agent runs at user login (lingers across logout if
 # `loginctl enable-linger $USER` is set), restarts on failure, and writes
 # logs to ~/.cache/fortytwo-agent.log.
 #
-# Pass a docker-container name as the 4th arg if the FortyTwo node is
-# running inside a Docker container (the agent will use `docker top` /
-# `docker inspect` instead of pgrep). Leave blank for native installs.
-#
-# System-wide install (root, runs without a logged-in user — useful for
+# System-wide install (root, runs without a logged-in user -- useful for
 # headless servers): set FORTYTWO_SYSTEMD_SCOPE=system before running.
 
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
+if [[ $# -lt 2 ]]; then
     cat >&2 <<EOF
-Usage: $0 <bot-url> <agent-token> <scripts-root> [docker-container]
+Usage: $0 <bot-url> <agent-token> [scripts-root] [docker-container]
 
-Example (native):
-    $0 https://<your-bot>.onrender.com \\
-        \$(openssl rand -hex 20) \\
+Example (auto-discovery -- one agent reports every local node; recommended):
+    $0 https://<your-bot>.onrender.com \$(openssl rand -hex 20)
+
+Example (single node -- pin to one scripts-root):
+    $0 https://<your-bot>.onrender.com \$(openssl rand -hex 20) \\
         ~/FortytwoCLI/fortytwo-p2p-inference-scripts-main
 
-Example (Docker — pass the container name as the 4th arg):
-    $0 https://<your-bot>.onrender.com \\
-        \$(openssl rand -hex 20) \\
-        ~/fortytwo-data/scripts \\
-        fortytwo-p2p-inference
+Example (Docker single node -- pass the container name as the 4th arg):
+    $0 https://<your-bot>.onrender.com \$(openssl rand -hex 20) \\
+        ~/fortytwo-data/scripts fortytwo-p2p-inference
 
 For a system-wide install (root, runs without a logged-in user):
     FORTYTWO_SYSTEMD_SCOPE=system sudo -E $0 <args>
@@ -40,7 +41,7 @@ fi
 
 BOT_URL="$1"
 AGENT_TOKEN="$2"
-SCRIPTS_ROOT="$3"
+SCRIPTS_ROOT="${3:-}"
 DOCKER_CONTAINER="${4:-}"
 SCOPE="${FORTYTWO_SYSTEMD_SCOPE:-user}"  # user (default) or system
 
@@ -62,15 +63,21 @@ if ! command -v python3 >/dev/null 2>&1; then
 fi
 if ! command -v systemctl >/dev/null 2>&1; then
     echo "ERROR: systemctl not available. This installer is systemd-only." >&2
-    echo "  Run the agent manually:" >&2
-    echo "  python3 $AGENT --bot-url $BOT_URL --agent-token <token> --scripts-root $SCRIPTS_ROOT" >&2
+    echo "  Run the agent manually (auto-discovery):" >&2
+    echo "  python3 $AGENT --bot-url $BOT_URL --agent-token <token>" >&2
     exit 1
 fi
 
-# Expand ~ in scripts-root
-SCRIPTS_ROOT="${SCRIPTS_ROOT/#\~/$HOME}"
-if [[ ! -d "$SCRIPTS_ROOT" ]]; then
-    echo "WARNING: $SCRIPTS_ROOT does not exist. Agent will fail until logs appear there." >&2
+# Build the optional --scripts-root arg. Empty => auto-discovery mode.
+MODE="auto-discovery (all local nodes)"
+SCRIPTS_ARG=""
+if [[ -n "$SCRIPTS_ROOT" ]]; then
+    SCRIPTS_ROOT="${SCRIPTS_ROOT/#\~/$HOME}"   # expand ~
+    if [[ ! -d "$SCRIPTS_ROOT" ]]; then
+        echo "WARNING: $SCRIPTS_ROOT does not exist. Agent will fail until logs appear there." >&2
+    fi
+    SCRIPTS_ARG="--scripts-root $SCRIPTS_ROOT"
+    MODE="single node: $SCRIPTS_ROOT"
 fi
 
 chmod +x "$AGENT"
@@ -112,7 +119,7 @@ sed \
     -e "s|{{AGENT_PATH}}|$AGENT|g" \
     -e "s|{{BOT_URL}}|$BOT_URL|g" \
     -e "s|{{AGENT_TOKEN}}|$AGENT_TOKEN|g" \
-    -e "s|{{SCRIPTS_ROOT}}|$SCRIPTS_ROOT|g" \
+    -e "s|{{SCRIPTS_ARG}}|$SCRIPTS_ARG|g" \
     -e "s|{{EXTRA_ARGS}}|$EXTRA_ARGS|g" \
     -e "s|{{LOG_PATH}}|$LOG_PATH|g" \
     "$TEMPLATE" >"$UNIT_PATH.tmp"
@@ -133,7 +140,7 @@ echo "Agent installed:"
 echo "  Scope:       $SCOPE"
 echo "  Unit:        $UNIT_PATH"
 echo "  Log:         $LOG_PATH"
-echo "  Scripts:     $SCRIPTS_ROOT"
+echo "  Mode:        $MODE"
 echo "  Bot URL:     $BOT_URL"
 if [[ -n "$DOCKER_CONTAINER" ]]; then
     echo "  Docker:      $DOCKER_CONTAINER (using \`docker top\` for process detection)"

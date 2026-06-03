@@ -9,3 +9,8 @@ agent/_agent-wrapper.ps1
 agent/agent.log
 agent/rounds-history.json
 agent/rounds-history.json.tmp
+# Per-node rounds history (auto-discovery) + the wallet->node_id map.
+# Per-machine runtime state, never committed.
+agent/rounds-history-*.json
+agent/discovered-nodes.json
+agent/discovered-nodes.json.tmp
