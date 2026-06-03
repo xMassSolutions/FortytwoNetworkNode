@@ -204,11 +204,13 @@ function Get-DockerProcessInfo($containerName) {
         $topOut = & docker top $containerName 2>$null
         if ($topOut) {
             foreach ($line in ($topOut -split "`n")) {
-                if ($line -match "FortytwoCapsule") {
+                # The official node image runs /workspace/capsule + /workspace/protocol
+                # (lowercase); native/renamed installs use FortytwoCapsule/Protocol. Match either.
+                if ($line -match '(FortytwoCapsule|/capsule)(\s|$)') {
                     $cols = ($line -split '\s+') | Where-Object { $_ -ne '' }
                     foreach ($c in $cols) { if ($c -match '^\d+$') { $result.capsulePid = [int]$c; $result.capsuleAlive = $true; break } }
                 }
-                if ($line -match "FortytwoProtocol") {
+                if ($line -match '(FortytwoProtocol|/protocol)(\s|$)') {
                     $cols = ($line -split '\s+') | Where-Object { $_ -ne '' }
                     foreach ($c in $cols) { if ($c -match '^\d+$') { $result.protocolPid = [int]$c; $result.protocolAlive = $true; break } }
                 }
@@ -324,7 +326,7 @@ function Get-ProtocolPidForRoot([string]$root) {
     return 0
 }
 
-function Get-DiscoveredNodes {
+function Get-NativeNodes {
     $nodes = @()
     $seen = @{}
     $caps = Get-CimInstance Win32_Process -Filter "Name = 'FortytwoCapsule.exe'" -ErrorAction SilentlyContinue
@@ -338,11 +340,14 @@ function Get-DiscoveredNodes {
         $extLog = Join-Path $root "extended_log.txt"
         $wallet = Get-OperatorWallet $extLog
         if (-not $wallet) {
-            Write-Output ("[discover] capsule pid={0} root={1} has no 'Operator Wallet Address' yet - skipping" -f $c.ProcessId, $root)
+            # Write-Host (not Write-Output) so the message does NOT leak into the
+            # returned node collection; *>> redirection still captures it to the log.
+            Write-Host ("[discover] capsule pid={0} root={1} has no 'Operator Wallet Address' yet - skipping" -f $c.ProcessId, $root)
             continue
         }
         $capLog = Resolve-CapsuleLogForRoot $root
         $nodes += [pscustomobject]@{
+            DockerContainer = $null
             ScriptsRoot = $root
             ExtLog      = $extLog
             CapsuleLog  = $capLog
@@ -351,6 +356,93 @@ function Get-DiscoveredNodes {
             NodeWallet  = $wallet
             CapsulePid  = $c.ProcessId
             ProtocolPid = (Get-ProtocolPidForRoot $root)
+        }
+    }
+    return ,$nodes
+}
+
+# ---------- Docker node auto-discovery ----------
+# The official node image runs capsule + protocol inside a container and writes
+# their output to the container's stdout (no host-mounted logs), so native
+# (Win32_Process) discovery can't see them. Enumerate from `docker ps`, read
+# wallet/port from `docker logs`/`docker inspect`, snapshot from `docker logs`.
+
+function Test-DockerAvailable {
+    try {
+        $null = & docker version --format '{{.Server.Version}}' 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+function Get-DockerLogs([string]$container, [int]$tail = 0) {
+    try {
+        if ($tail -gt 0) { return (& docker logs --tail $tail $container 2>&1 | Out-String) }
+        return (& docker logs $container 2>&1 | Out-String)
+    } catch { return "" }
+}
+
+function Get-DockerCapsuleAlive([string]$container, [int]$port) {
+    # /ready is loopback-only inside the container -- probe via `docker exec`.
+    try {
+        $null = & docker exec $container curl -fsS ("http://127.0.0.1:{0}/ready" -f $port) 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
+function Get-DockerNodes {
+    $nodes = @()
+    if (-not (Test-DockerAvailable)) { return ,$nodes }
+    # container -> @{ Wallet; Port }, both from the container's startup logs
+    # (which scroll off a tail, so cache once seen).
+    if ($null -eq $script:DockerNodeCache) { $script:DockerNodeCache = @{} }
+    $names = @(& docker ps --format '{{.Names}}' 2>$null | Where-Object { $_ -and $_.Trim() })
+    foreach ($name in $names) {
+        $di = Get-DockerProcessInfo $name
+        if (-not $di.capsulePid -and -not $di.protocolPid) { continue }   # not a node
+        $cached = $script:DockerNodeCache[$name]
+        if ($cached) {
+            $wallet = $cached.Wallet; $port = $cached.Port
+        } else {
+            $logs = Get-DockerLogs $name
+            $wallet = $null
+            $m = [regex]::Matches($logs, 'Operator Wallet Address:\s*(0x[0-9a-fA-F]{40})')
+            if ($m.Count -gt 0) { $wallet = $m[$m.Count - 1].Groups[1].Value }
+            # Read the ready-port from `docker logs` (NOT `docker inspect`
+            # Config.Env, which would expose FT_ACCOUNT_PRIVATE_KEY).
+            $port = 42442
+            $pm = [regex]::Matches($logs, 'Server running at https?://[^:/\s]+:(\d+)')
+            if ($pm.Count -gt 0) { $port = [int]$pm[$pm.Count - 1].Groups[1].Value }
+            if ($wallet) { $script:DockerNodeCache[$name] = @{ Wallet = $wallet; Port = $port } }
+        }
+        if (-not $wallet) {
+            Write-Host ("[discover] docker container '{0}' has no 'Operator Wallet Address' yet - skipping" -f $name)
+            continue
+        }
+        $nodes += [pscustomobject]@{
+            DockerContainer = $name
+            ScriptsRoot     = $null
+            NodeId          = (Get-NodeIdForWallet $wallet)
+            NodeWallet      = $wallet
+            CapsulePid      = $di.capsulePid
+            ProtocolPid     = $di.protocolPid
+            CapsuleAlive    = (Get-DockerCapsuleAlive $name $port)
+            CapsuleHttpPort = $port
+            ContainerUptime = $di.uptimeSeconds
+        }
+    }
+    return ,$nodes
+}
+
+function Get-DiscoveredNodes {
+    # Every node on this machine: native host processes + Docker containers,
+    # deduped by wallet (native first).
+    $nodes = @(Get-NativeNodes | Where-Object { $_.NodeWallet })
+    $seen = @{}
+    foreach ($n in $nodes) { $seen[$n.NodeWallet.ToLower()] = $true }
+    foreach ($d in @(Get-DockerNodes | Where-Object { $_.NodeWallet })) {
+        if (-not $seen.ContainsKey($d.NodeWallet.ToLower())) {
+            $seen[$d.NodeWallet.ToLower()] = $true
+            $nodes += $d
         }
     }
     return ,$nodes
@@ -370,7 +462,10 @@ function Get-NodeSnapshot {
         # so a multi-node host never reports the same pid for every node. Null
         # in legacy single-node mode -> fall back to a global first-match.
         [int]$CapsulePid           = 0,
-        [int]$ProtocolPid          = 0
+        [int]$ProtocolPid          = 0,
+        # Docker nodes' /ready is loopback-only inside the container; discovery
+        # resolves aliveness via `docker exec` and passes it here ($null = probe).
+        [object]$CapsuleAliveOverride = $null
     )
     $todayUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
 
@@ -717,11 +812,15 @@ function Get-NodeSnapshot {
         if ($pvLine) { $protocolVersion = $pvLine.Matches[0].Groups[1].Value }
     }
 
-    $capsuleAlive = $false
-    try {
-        $r = Invoke-WebRequest -Uri $ReadyUrl -UseBasicParsing -TimeoutSec 3
-        if ($r.StatusCode -eq 200) { $capsuleAlive = $true }
-    } catch { $capsuleAlive = $false }
+    if ($null -ne $CapsuleAliveOverride) {
+        $capsuleAlive = [bool]$CapsuleAliveOverride
+    } else {
+        $capsuleAlive = $false
+        try {
+            $r = Invoke-WebRequest -Uri $ReadyUrl -UseBasicParsing -TimeoutSec 3
+            if ($r.StatusCode -eq 200) { $capsuleAlive = $true }
+        } catch { $capsuleAlive = $false }
+    }
     $protocolAlive = $dockerProtoAlive
 
     # Rolling 30-day rounds history (persisted to rounds-history.json next to this script)
@@ -804,7 +903,29 @@ $AutoMode = -not $ScriptsRoot
 
 # Build a per-node snapshot in auto mode (per-node paths + a per-node rounds
 # history file so multi-node hourly counts never cross-contaminate).
+function Get-DockerNodeSnapshot($n) {
+    # Capture `docker logs` (combined capsule+protocol stdout) to a temp dir and
+    # reuse Get-NodeSnapshot. pids + capsule-aliveness come from discovery.
+    $hist = Join-Path $PSScriptRoot ("rounds-history-{0}.json" -f $n.NodeId)
+    $work = Join-Path $env:TEMP ("fortytwo-agent-docker\node-{0}" -f $n.NodeId)
+    $dbg  = Join-Path $work "FortytwoNode\debug"
+    New-Item -ItemType Directory -Force $dbg | Out-Null
+    $logs = Get-DockerLogs $n.DockerContainer 50000
+    $extLog = Join-Path $work "extended_log.txt"
+    $capLog = Join-Path $dbg "FortytwoCapsule.log"
+    Set-Content -Path $extLog -Value $logs -Encoding UTF8
+    Set-Content -Path $capLog -Value $logs -Encoding UTF8
+    $snap = Get-NodeSnapshot -ScriptsRoot $work -ExtLog $extLog -CapsuleLog $capLog `
+        -ReadyUrl "" -NodeId $n.NodeId -NodeWallet $n.NodeWallet -RoundsHistoryFile $hist `
+        -CapsulePid $n.CapsulePid -ProtocolPid $n.ProtocolPid -CapsuleAliveOverride $n.CapsuleAlive
+    if ((-not $snap.capsule_uptime_seconds) -and $n.ContainerUptime) {
+        $snap.capsule_uptime_seconds = $n.ContainerUptime
+    }
+    return $snap
+}
+
 function Get-AutoNodeSnapshot($n) {
+    if ($n.DockerContainer) { return (Get-DockerNodeSnapshot $n) }
     $hist = Join-Path $PSScriptRoot ("rounds-history-{0}.json" -f $n.NodeId)
     return Get-NodeSnapshot -ScriptsRoot $n.ScriptsRoot -ExtLog $n.ExtLog `
         -CapsuleLog $n.CapsuleLog -ReadyUrl $n.ReadyUrl -NodeId $n.NodeId `

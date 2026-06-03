@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -392,6 +393,13 @@ def process_uptime_seconds(pid: int) -> int | None:
 
 # ---------- Docker process detection ----------
 
+# Match a capsule/protocol process in `docker top` output. The official node
+# image runs `/workspace/capsule` + `/workspace/protocol`; native/renamed
+# installs use FortytwoCapsule / FortytwoProtocol. Path-anchored so a stray
+# "capsule" in some argument doesn't false-match.
+_CAPSULE_PROC_RE = re.compile(r"(?:FortytwoCapsule|/capsule)(?:\s|$)")
+_PROTOCOL_PROC_RE = re.compile(r"(?:FortytwoProtocol|/protocol)(?:\s|$)")
+
 
 def get_docker_process_info(container: str | None) -> dict[str, Any]:
     """Resolve Capsule/Protocol PIDs + container uptime via Docker.
@@ -434,12 +442,15 @@ def get_docker_process_info(container: str | None) -> dict[str, Any]:
         )
         if r.returncode == 0 and r.stdout.strip():
             for line in r.stdout.splitlines():
-                if "FortytwoCapsule" in line:
+                # The official node image runs `/workspace/capsule` and
+                # `/workspace/protocol` (lowercase); native installs use
+                # FortytwoCapsule / FortytwoProtocol. Match either.
+                if _CAPSULE_PROC_RE.search(line):
                     for tok in line.split():
                         if tok.isdigit():
                             out["capsule_pid"] = int(tok)
                             break
-                if "FortytwoProtocol" in line:
+                if _PROTOCOL_PROC_RE.search(line):
                     for tok in line.split():
                         if tok.isdigit():
                             out["protocol_pid"] = int(tok)
@@ -616,11 +627,11 @@ def assign_node_id(wallet: str, path: Path = NODE_MAP_FILE) -> int:
     return nid
 
 
-def discover_nodes(node_map_file: Path = NODE_MAP_FILE) -> list[dict[str, Any]]:
-    """Enumerate every running FortyTwo node on this host. Returns one dict per
-    node: {scripts_root, node_wallet, node_id, ready_url, capsule_pid}. Nodes
-    whose wallet hasn't been logged yet are skipped (with a one-line note) so we
-    never invent an unstable id or 422 the server with a missing wallet."""
+def discover_native_nodes(node_map_file: Path = NODE_MAP_FILE) -> list[dict[str, Any]]:
+    """Enumerate native (non-Docker) FortyTwo nodes on this host. One dict per
+    node: {scripts_root, node_wallet, node_id, ready_url, capsule_pid,
+    protocol_pid}. Nodes whose wallet hasn't been logged yet are skipped (with a
+    one-line note) so we never invent an unstable id or 422 the server."""
     nodes: list[dict[str, Any]] = []
     seen_roots: set[str] = set()
     for pid in find_all_pids("FortytwoCapsule"):
@@ -654,6 +665,136 @@ def discover_nodes(node_map_file: Path = NODE_MAP_FILE) -> list[dict[str, Any]]:
     return nodes
 
 
+# ---------- Docker node auto-discovery ----------
+#
+# The official node image runs the capsule + protocol inside a container and
+# writes their output to the container's stdout (no host-mounted log files), so
+# native (pgrep + cwd) discovery can't see them. Docker nodes are enumerated
+# from `docker ps`, their wallet/ready-port read from `docker logs`, and their
+# snapshot built by capturing `docker logs` to a temp dir + reusing
+# get_node_snapshot. Two native protocol processes can't coexist on one host
+# (fixed RPC port), so Docker is the supported way to run several nodes per box.
+
+DOCKER_LOG_TAIL = 50000          # bound the per-cycle `docker logs` capture
+# container -> (wallet, ready_port), both read from the container's STARTUP logs
+# (which scroll off a tail, so cache once seen). We deliberately read the port
+# from `docker logs` rather than `docker inspect` Config.Env -- the latter would
+# pull the whole container environment, which includes FT_ACCOUNT_PRIVATE_KEY,
+# and the agent must never handle the node's private key.
+_DOCKER_NODE_CACHE: dict[str, tuple[str, int]] = {}
+
+
+def _docker(args: list[str], timeout: int = 6) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except Exception:
+        return 1, ""
+
+
+def docker_available() -> bool:
+    rc, _ = _docker(["version", "--format", "{{.Server.Version}}"], timeout=4)
+    return rc == 0
+
+
+def _docker_logs(container: str, tail: int | None = None) -> str:
+    args = ["logs"]
+    if tail is not None:
+        args += ["--tail", str(tail)]
+    args.append(container)
+    # docker writes container stderr to OUR stderr; capture both via the shell-
+    # free path: call twice is wasteful, so just merge by reading combined.
+    try:
+        r = subprocess.run(["docker", *args], capture_output=True, text=True, timeout=15)
+        return (r.stdout or "") + (r.stderr or "")
+    except Exception:
+        return ""
+
+
+def _ready_port_from_text(text: str) -> int | None:
+    m = None
+    for m in READY_PORT_RE.finditer(text or ""):
+        pass
+    return int(m.group(1)) if m else None
+
+
+def _docker_capsule_alive(container: str, port: int) -> bool:
+    # The capsule's /ready is loopback-only inside the container, so probe it
+    # from inside via `docker exec`. The image ships curl (start-node uses it).
+    rc, _ = _docker(
+        ["exec", container, "curl", "-fsS", f"http://127.0.0.1:{port}/ready"],
+        timeout=6,
+    )
+    return rc == 0
+
+
+def docker_node_containers() -> list[str]:
+    """Running containers that look like a FortyTwo node (a capsule/protocol
+    process shows up in `docker top`)."""
+    rc, out = _docker(["ps", "--format", "{{.Names}}"])
+    if rc != 0:
+        return []
+    result = []
+    for name in (n.strip() for n in out.splitlines() if n.strip()):
+        di = get_docker_process_info(name)
+        if di["capsule_pid"] or di["protocol_pid"]:
+            result.append(name)
+    return result
+
+
+def discover_docker_nodes(node_map_file: Path = NODE_MAP_FILE) -> list[dict[str, Any]]:
+    """Enumerate FortyTwo nodes running as Docker containers. One dict per node:
+    {docker_container, node_wallet, node_id, capsule_pid, protocol_pid,
+    capsule_alive, capsule_http_port, container_uptime}."""
+    if not docker_available():
+        return []
+    nodes: list[dict[str, Any]] = []
+    for c in docker_node_containers():
+        di = get_docker_process_info(c)
+        cached = _DOCKER_NODE_CACHE.get(c)
+        if cached:
+            wallet, port = cached
+        else:
+            # Wallet + ready-port are both logged at startup (oldest lines) ->
+            # read full logs once and cache, so later cycles need only a tail.
+            logs = _docker_logs(c)
+            wallet = parse_operator_wallet(logs)
+            port = _ready_port_from_text(logs) or DEFAULT_READY_PORT
+            if wallet:
+                _DOCKER_NODE_CACHE[c] = (wallet, port)
+        if not wallet:
+            print(
+                f"[discover] docker container '{c}' has no 'Operator Wallet "
+                f"Address' yet - skipping until it appears",
+                flush=True,
+            )
+            continue
+        nodes.append({
+            "docker_container": c,
+            "node_wallet": wallet,
+            "node_id": assign_node_id(wallet, node_map_file),
+            "capsule_pid": di["capsule_pid"],
+            "protocol_pid": di["protocol_pid"],
+            "capsule_alive": _docker_capsule_alive(c, port),
+            "capsule_http_port": port,
+            "container_uptime": di["uptime_seconds"],
+        })
+    return nodes
+
+
+def discover_nodes(node_map_file: Path = NODE_MAP_FILE) -> list[dict[str, Any]]:
+    """Every FortyTwo node on this machine: native host processes + Docker
+    containers. Deduped by wallet (a wallet running both ways is reported once,
+    native first)."""
+    nodes = discover_native_nodes(node_map_file)
+    seen = {n["node_wallet"].lower() for n in nodes}
+    for d in discover_docker_nodes(node_map_file):
+        if d["node_wallet"].lower() not in seen:
+            seen.add(d["node_wallet"].lower())
+            nodes.append(d)
+    return nodes
+
+
 # ---------- snapshot construction ----------
 
 
@@ -664,6 +805,7 @@ def get_node_snapshot(
     ready_url: str | None = None,
     capsule_pid: int | None = None,
     protocol_pid: int | None = None,
+    capsule_alive_override: bool | None = None,
 ) -> dict[str, Any]:
     ext_log = scripts_root / "extended_log.txt"
     capsule_log = resolve_capsule_log(scripts_root)
@@ -956,7 +1098,12 @@ def get_node_snapshot(
     if last_pv:
         protocol_version = last_pv.group(1)
 
-    capsule_alive = capsule_ready(ready_url)
+    # capsule_alive: an explicit override (Docker nodes, whose /ready is
+    # loopback-only inside the container) wins; otherwise probe the URL.
+    capsule_alive = (
+        capsule_alive_override if capsule_alive_override is not None
+        else capsule_ready(ready_url)
+    )
     protocol_alive = (
         proto_alive_override if proto_alive_override is not None
         else proto_pid is not None
@@ -1053,6 +1200,44 @@ def post_snapshot(
         print(f"[{stamp}] push HTTP {e.code}: {e.reason}", flush=True)
     except Exception as e:
         print(f"[{stamp}] push exception: {e}", flush=True)
+
+
+# ---------- per-node snapshot dispatch (native + docker) ----------
+
+DOCKER_WORK_DIR = Path(tempfile.gettempdir()) / "fortytwo-agent-docker"
+
+
+def get_docker_node_snapshot(n: dict[str, Any], history_file: Path) -> dict[str, Any]:
+    """Snapshot a Docker node: capture `docker logs` to a temp dir and reuse
+    get_node_snapshot. The container stdout interleaves protocol + capsule
+    output, so the same combined stream is fed as both logs (the parsers key off
+    distinct line markers). pids + capsule_alive come from discovery."""
+    c = n["docker_container"]
+    logs = _docker_logs(c, tail=DOCKER_LOG_TAIL)
+    root = DOCKER_WORK_DIR / f"node-{n['node_id']}"
+    (root / "FortytwoNode" / "debug").mkdir(parents=True, exist_ok=True)
+    (root / "extended_log.txt").write_text(logs, encoding="utf-8")
+    (root / "FortytwoNode" / "debug" / "FortytwoCapsule.log").write_text(logs, encoding="utf-8")
+    snap = get_node_snapshot(
+        root, history_file, docker_container=None, ready_url=None,
+        capsule_pid=n["capsule_pid"], protocol_pid=n["protocol_pid"],
+        capsule_alive_override=n["capsule_alive"],
+    )
+    if snap.get("capsule_uptime_seconds") is None and n.get("container_uptime"):
+        snap["capsule_uptime_seconds"] = n["container_uptime"]
+    return snap
+
+
+def snapshot_for_discovered(n: dict[str, Any], agent_dir: Path) -> dict[str, Any]:
+    """Build a snapshot for one discovered node, dispatching to the Docker or
+    native path. Uses a per-node rounds-history file so multi-node hourly counts
+    never cross-contaminate."""
+    hist = agent_dir / f"rounds-history-{n['node_id']}.json"
+    if n.get("docker_container"):
+        return get_docker_node_snapshot(n, hist)
+    return get_node_snapshot(
+        n["scripts_root"], hist, None, ready_url=n["ready_url"],
+        capsule_pid=n["capsule_pid"], protocol_pid=n["protocol_pid"])
 
 
 # ---------- event loop ----------
@@ -1234,11 +1419,8 @@ def auto_event_loop(args: argparse.Namespace) -> None:
                 stamp = utc_now().strftime("%H:%M:%S")
                 print(f"[{stamp}] no FortyTwo nodes discovered", flush=True)
             for n in nodes:
-                hist = agent_dir / f"rounds-history-{n['node_id']}.json"
                 try:
-                    snap = get_node_snapshot(
-                        n["scripts_root"], hist, None, ready_url=n["ready_url"],
-                    capsule_pid=n["capsule_pid"], protocol_pid=n["protocol_pid"])
+                    snap = snapshot_for_discovered(n, agent_dir)
                     post_snapshot(
                         args.bot_url, args.agent_token, snap,
                         node_id=n["node_id"], wallet=n["node_wallet"])
@@ -1366,23 +1548,17 @@ def main() -> int:
         if args.dry_run:
             out: list[dict[str, Any]] = []
             for n in discover_nodes():
-                hist = agent_dir / f"rounds-history-{n['node_id']}.json"
-                snap = get_node_snapshot(
-                    n["scripts_root"], hist, None, ready_url=n["ready_url"],
-                    capsule_pid=n["capsule_pid"], protocol_pid=n["protocol_pid"])
+                snap = snapshot_for_discovered(n, agent_dir)
                 snap["node_id"] = n["node_id"]
                 snap["node_wallet"] = n["node_wallet"]
-                snap["_scripts_root"] = str(n["scripts_root"])
-                snap["_ready_url"] = n["ready_url"]
+                snap["_source"] = "docker" if n.get("docker_container") else "native"
+                snap["_location"] = n.get("docker_container") or str(n.get("scripts_root"))
                 out.append(snap)
             print(json.dumps(out, indent=2, default=str))
             return 0
         if args.once:
             for n in discover_nodes():
-                hist = agent_dir / f"rounds-history-{n['node_id']}.json"
-                snap = get_node_snapshot(
-                    n["scripts_root"], hist, None, ready_url=n["ready_url"],
-                    capsule_pid=n["capsule_pid"], protocol_pid=n["protocol_pid"])
+                snap = snapshot_for_discovered(n, agent_dir)
                 post_snapshot(
                     args.bot_url, args.agent_token, snap,
                     node_id=n["node_id"], wallet=n["node_wallet"])

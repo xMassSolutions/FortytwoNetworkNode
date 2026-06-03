@@ -165,3 +165,75 @@ def test_post_snapshot_omits_wallet_when_absent(monkeypatch):
                                          "model_short": "m", "capsule_alive": False,
                                          "protocol_alive": False}, node_id=1)
     assert "node_wallet" not in captured["body"]
+
+
+# ---------- docker discovery ----------
+
+
+def test_docker_proc_regexes_match_image_and_native_names():
+    # `docker top` shows the official image's "/workspace/capsule"; native
+    # installs use FortytwoCapsule. Both must match; a stray arg must not.
+    assert pa._CAPSULE_PROC_RE.search("root 123 /workspace/capsule")
+    assert pa._CAPSULE_PROC_RE.search("root 123 /opt/FortytwoCapsule")
+    assert pa._PROTOCOL_PROC_RE.search("root 9 /workspace/protocol --flag")
+    assert not pa._CAPSULE_PROC_RE.search("root 1 /bin/capsule-helperd")
+
+
+def test_get_docker_process_info_matches_lowercase_capsule(monkeypatch):
+    # The image runs /workspace/capsule + /workspace/protocol (lowercase) -- the
+    # old code only matched FortytwoCapsule and reported them dead.
+    def fake_run(args, **kw):
+        joined = " ".join(args)
+        if "{{.State.Running}}" in joined:
+            return _R(0, "true\n")
+        if "{{.State.StartedAt}}" in joined:
+            return _R(0, "2026-06-03T00:00:00.000000000Z\n")
+        if args[:2] == ["docker", "top"]:
+            return _R(0, "UID PID CMD\nroot 111 /workspace/capsule\nroot 222 /workspace/protocol\n")
+        return _R(1, "")
+    monkeypatch.setattr(pa.subprocess, "run", fake_run)
+    di = pa.get_docker_process_info("node1")
+    assert di["capsule_pid"] == 111
+    assert di["protocol_pid"] == 222
+    assert di["protocol_alive"] is True
+
+
+def test_ready_port_from_text_last_match():
+    txt = ("Server running at http://0.0.0.0:42442\n"
+           "...restart...\nServer running at http://0.0.0.0:42443\n")
+    assert pa._ready_port_from_text(txt) == 42443
+    assert pa._ready_port_from_text("no port here") is None
+
+
+def test_discover_docker_nodes_builds_node(monkeypatch, tmp_path):
+    # End-to-end discovery with the docker CLI faked out. Wallet AND ready-port
+    # both come from `docker logs` (never from Config.Env, which holds the key).
+    pa._DOCKER_NODE_CACHE.clear()
+    monkeypatch.setattr(pa, "docker_available", lambda: True)
+    monkeypatch.setattr(pa, "docker_node_containers", lambda: ["node1"])
+    monkeypatch.setattr(pa, "get_docker_process_info", lambda c: {
+        "capsule_pid": 10, "protocol_pid": 11, "protocol_alive": True, "uptime_seconds": 99})
+    wallet = "0x" + "c" * 40
+    monkeypatch.setattr(pa, "_docker_logs",
+                        lambda c, tail=None: f"INFO Operator Wallet Address: {wallet}\n"
+                                             "INFO Server running at http://0.0.0.0:42443\n")
+    monkeypatch.setattr(pa, "_docker_capsule_alive", lambda c, port: True)
+    monkeypatch.setattr(pa, "NODE_MAP_FILE", tmp_path / "m.json")
+    nodes = pa.discover_docker_nodes(tmp_path / "m.json")
+    assert len(nodes) == 1
+    n = nodes[0]
+    assert n["docker_container"] == "node1"
+    assert n["node_wallet"] == wallet
+    assert n["capsule_pid"] == 10 and n["protocol_pid"] == 11
+    assert n["capsule_alive"] is True
+    assert n["capsule_http_port"] == 42443   # parsed from the log line
+
+
+def test_discover_docker_nodes_skips_without_wallet(monkeypatch, tmp_path):
+    pa._DOCKER_NODE_CACHE.clear()
+    monkeypatch.setattr(pa, "docker_available", lambda: True)
+    monkeypatch.setattr(pa, "docker_node_containers", lambda: ["fresh"])
+    monkeypatch.setattr(pa, "get_docker_process_info", lambda c: {
+        "capsule_pid": 5, "protocol_pid": None, "protocol_alive": False, "uptime_seconds": 1})
+    monkeypatch.setattr(pa, "_docker_logs", lambda c, tail=None: "still booting, no wallet yet\n")
+    assert pa.discover_docker_nodes(tmp_path / "m.json") == []
