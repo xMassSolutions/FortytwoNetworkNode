@@ -290,8 +290,6 @@ def _verify_session_cookie(token: str | None) -> bool:
 
 def require_login(session: str | None = Cookie(default=None)) -> None:
     """FastAPI dependency for HTML routes: 303 to /login when not authed."""
-    if not AUTH_ENABLED:
-        return
     if not _verify_session_cookie(session):
         raise HTTPException(status_code=303, headers={"Location": "/login"})
 
@@ -299,8 +297,6 @@ def require_login(session: str | None = Cookie(default=None)) -> None:
 def require_login_json(session: str | None = Cookie(default=None)) -> None:
     """Same as require_login but 401 (no redirect) -- right for JSON
     endpoints so the dashboard SPA can detect it and navigate itself."""
-    if not AUTH_ENABLED:
-        return
     if not _verify_session_cookie(session):
         raise HTTPException(status_code=401, detail="not logged in")
 
@@ -476,15 +472,24 @@ async def _background_uptime_sampler() -> None:
         await asyncio.sleep(UPTIME_SAMPLE_INTERVAL_SECS)
 
 
+def _require_auth_configured() -> None:
+    """Mandatory dashboard login: refuse to boot without credentials so the
+    dashboard can never come up open to the world."""
+    if not AUTH_ENABLED:
+        raise RuntimeError(
+            "Dashboard login is mandatory: set DASHBOARD_USER and "
+            "DASHBOARD_PASS_HASH (the bcrypt hash of your password). Generate it "
+            "with:\n  python3 -c \"import bcrypt,getpass; "
+            "print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt()).decode())\""
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_schema()
     log.info("SQLite schema initialised")
-    if AUTH_ENABLED:
-        log.info("dashboard auth ENABLED (user=%s)", DASHBOARD_USER)
-    else:
-        log.warning("dashboard auth DISABLED -- set DASHBOARD_USER and "
-                    "DASHBOARD_PASS_HASH to lock down the dashboard")
+    _require_auth_configured()
+    log.info("dashboard auth ENABLED (user=%s)", DASHBOARD_USER)
     if not os.environ.get("SESSION_SECRET", "").strip():
         log.warning("SESSION_SECRET unset -- sessions invalidate on every "
                     "restart (set it in Render to make sessions sticky)")
@@ -730,10 +735,7 @@ async def dashboard_node(node_id: int, _: None = Depends(require_login)):
 @app.get("/login", include_in_schema=False)
 async def login_form(session: str | None = Cookie(default=None)):
     # Already signed in -> straight to the dashboard.
-    if AUTH_ENABLED and _verify_session_cookie(session):
-        return RedirectResponse(url="/dashboard/1", status_code=303)
-    # Auth disabled -> there's nothing to log in to; skip the form.
-    if not AUTH_ENABLED:
+    if _verify_session_cookie(session):
         return RedirectResponse(url="/dashboard/1", status_code=303)
     return HTMLResponse(content=LOGIN_HTML)
 
@@ -926,9 +928,8 @@ async def dashboard_data(node: int = 1, _: None = Depends(require_login_json)):
             "log_extended": s.log_extended,
             "log_capsule": s.log_capsule,
         }
-    # Always surface 1 and 2 in the tab strip even before either has booted
-    # so the user can navigate to the about-to-come-online node.
-    known_nodes = sorted(set(store.known_node_ids()) | {1, 2})
+    # Only real nodes that have actually pushed -- no phantom placeholders.
+    known_nodes = sorted(store.known_node_ids())
     return JSONResponse({
         "snapshot": snapshot_dict,
         "balance": balance,
@@ -979,7 +980,7 @@ async def dashboard_overview_data(_: None = Depends(require_login_json)):
     Deduplicates `earned_today` per distinct wallet so two nodes sharing one
     operator wallet don't double-count the day's payouts."""
     now = time.time()
-    known = sorted(set(store.known_node_ids()) | {1, 2})
+    known = sorted(store.known_node_ids())
     nodes_out: list[dict] = []
     earned_per_wallet: dict[str, float] = {}
     total_participations = 0

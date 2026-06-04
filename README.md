@@ -6,7 +6,7 @@ Self-hostable dashboard + workstation agent for monitoring one or more [FortyTwo
 
 - **One or many nodes, one dashboard.** `/dashboard` shows an aggregate page — one tile per node with today's FOR + TPS + uptime + last-seen — plus combined totals. Click a tile to drill into the per-node view at `/dashboard/<id>`. Per-node operator wallets, balances and reward histories stay isolated.
 - **Durable reward history.** Point the bot at a free [Neon](https://neon.tech) Postgres and today's per-hour FOR earnings + the rolling rounds-participated chart survive every Render cold start and redeploy. Without it, the bot still runs on ephemeral SQLite — just forgets yesterday.
-- **Optional login wall.** Username/password in front of every dashboard page and JSON endpoint. Plaintext password never lives on the server — you generate a bcrypt hash locally and paste only the hash into Render. Sessions stick for 7 days; one click to log out.
+- **Mandatory login wall.** Username/password in front of every dashboard page and JSON endpoint — the server refuses to boot without it. Plaintext password never lives on the server — you generate a bcrypt hash locally and paste only the hash into Render. Sessions stick for 7 days; one click to log out.
 - **Live node telemetry.** FOR + MONAD balance, today's on-chain earnings, last reward, model + size, GPU + VRAM, TPS / symbols/sec, Capsule + Protocol versions + uptime, first / last round times — auto-refreshed every 5 s.
 - **Heartbeat uptime.** Per-node 24h / 7d uptime percentages on the dashboard, rolled up from one-per-minute samples persisted to Postgres (or SQLite). "Alive" = an agent push landed in the last 90 s.
 - **Per-round history.** Every inference round (hash, tx hash, completion time, duration, reward) persists to a `rounds` table. Query via `GET /v1/rounds?node=N&since=YYYY-MM-DDTHH:MM:SSZ&limit=N` for ad-hoc reporting ("best-paying round ever", "every round on Tuesday").
@@ -45,9 +45,9 @@ If you have a coding agent with tool use (Claude, ChatGPT-with-tools, etc.), pas
 >    my Render region, copy the pooled connection string, set it as
 >    `DATABASE_URL` in Render. (If I say I don't want this, skip and let
 >    the bot fall back to ephemeral SQLite.)
-> 4. (Optional, ask me first.) Lock the dashboard behind a login:
->    generate a random password, hash it with `bcrypt.hashpw`, set
->    `DASHBOARD_USER`, `DASHBOARD_PASS_HASH`, and a random hex
+> 4. (Required.) Lock the dashboard behind a login — the server won't boot
+>    without it: generate a random password, hash it with `bcrypt.hashpw`,
+>    set `DASHBOARD_USER`, `DASHBOARD_PASS_HASH`, and a random hex
 >    `SESSION_SECRET` on Render. Tell me the password once at the end.
 > 5. Detect my OS and install the workstation agent for node 1:
 >    - Windows: `agent/install-as-task.ps1 -BotUrl <URL> -AgentToken <TOKEN> -ScriptsRoot <PATH>` where `<PATH>` is my `fortytwo-p2p-inference-scripts-main` folder.
@@ -55,9 +55,9 @@ If you have a coding agent with tool use (Claude, ChatGPT-with-tools, etc.), pas
 >    - Linux: `agent/install-linux.sh <URL> <TOKEN> <SCRIPTS_ROOT>`.
 > 6. If I have a second node, repeat step 5 with `-NodeId 2 -NodeWallet 0x…`
 >    (or the equivalent for Mac/Linux).
-> 7. Open `<URL>/dashboard/1`, log in if I set up auth, and confirm
+> 7. Open `<URL>/dashboard/1`, log in, and confirm
 >    the node stats are populating.
-> 8. Tell me the dashboard URL (and password if you set one) when done.
+> 8. Tell me the dashboard URL and password when done.
 >
 > Tools required: GitHub access (to fork), terminal access (to install the
 > agent), a Render account, and optionally a Neon account. Wallet address
@@ -93,7 +93,7 @@ openssl rand -hex 20
    | `WALLET` | yes | Your Monad Testnet operator wallet (`0x…`) |
    | `AGENT_TOKEN` | yes | The shared secret you generated above |
    | `DATABASE_URL` | recommended | Postgres URL — see [Durable storage](#durable-storage-neon-postgres) below. If unset, reward history vanishes on every cold start. |
-   | `DASHBOARD_USER`, `DASHBOARD_PASS_HASH`, `SESSION_SECRET` | optional | Set these to lock the dashboard behind a login — see [Dashboard auth](#dashboard-auth-optional) below. |
+   | `DASHBOARD_USER`, `DASHBOARD_PASS_HASH` | **required** | Login is mandatory — the server won't boot without these. `SESSION_SECRET` (recommended) keeps sessions sticky across redeploys. See [Dashboard auth](#dashboard-auth-required) below. |
 
 5. **Apply**. First build is 3–5 min (Docker image build).
 6. Verify: open `https://<service>.onrender.com/healthz` — should return `{"ok":true}`.
@@ -198,9 +198,9 @@ Render's free tier wipes `/tmp` (where the bot's default SQLite lives) on every 
 
 The bot creates its tables on first boot. No manual schema setup needed. Any standard Postgres URL works — Supabase, self-hosted, whatever.
 
-### Dashboard auth (optional)
+### Dashboard auth (required)
 
-By default the dashboard is public to anyone with the URL. Set three env vars to gate it behind a username/password. The **plaintext password never lives on the server** — you store a bcrypt hash and type the real password into a login form.
+Login is **mandatory** — the server refuses to boot unless `DASHBOARD_USER` and `DASHBOARD_PASS_HASH` are set. The **plaintext password never lives on the server** — you store a bcrypt hash and type the real password into a login form.
 
 1. Generate the hash on your local machine:
 
@@ -223,7 +223,7 @@ By default the dashboard is public to anyone with the URL. Set three env vars to
 
 **Brute-force protection.** `/login` is rate-limited per client IP — 5 failed attempts in 15 min triggers a 429 with `Retry-After`. Tune with `LOGIN_RATE_LIMIT_MAX` and `LOGIN_RATE_LIMIT_WINDOW_SECS` if needed. Successful logins reset the counter.
 
-To turn auth off: clear `DASHBOARD_USER` and `DASHBOARD_PASS_HASH` and redeploy. The bot logs `WARN: dashboard auth DISABLED …` on every boot while running unprotected.
+Auth cannot be disabled: with `DASHBOARD_USER`/`DASHBOARD_PASS_HASH` unset the server raises `RuntimeError: Dashboard login is mandatory …` at boot and won't serve. For a plain-http LAN self-test, set `COOKIE_INSECURE=1` so the session cookie isn't marked `Secure` (otherwise the login won't stick over http).
 
 ### Running multiple nodes against one dashboard
 
@@ -296,8 +296,8 @@ Change cadence: set `FORTYTWO_AUTOUPDATE_MINUTES=N` (integer minutes; `0` disabl
 | `WALLET` | yes | — | Operator wallet. Service fails to start without it. |
 | `AGENT_TOKEN` | yes | — | Shared secret between bot and agent |
 | `DATABASE_URL` | recommended | — | Postgres URL. Unset → SQLite at `/tmp` (ephemeral on Render). |
-| `DASHBOARD_USER` | optional | — | Set with `DASHBOARD_PASS_HASH` to require login. |
-| `DASHBOARD_PASS_HASH` | optional | — | bcrypt hash from the one-liner in [Dashboard auth](#dashboard-auth-optional). |
+| `DASHBOARD_USER` | **yes** | — | Mandatory login — the server won't boot without it (paired with `DASHBOARD_PASS_HASH`). |
+| `DASHBOARD_PASS_HASH` | **yes** | — | bcrypt hash from the one-liner in [Dashboard auth](#dashboard-auth-required). |
 | `SESSION_SECRET` | optional | random per boot | HMAC key for session cookies. Set it to make sessions survive redeploys. |
 | `LOGIN_RATE_LIMIT_MAX` | no | `5` | Max failed `/login` attempts per IP per window before 429. `0` disables. |
 | `LOGIN_RATE_LIMIT_WINDOW_SECS` | no | `900` | Sliding-window length for the failure counter (default 15 min). |
@@ -341,7 +341,7 @@ Change cadence: set `FORTYTWO_AUTOUPDATE_MINUTES=N` (integer minutes; `0` disabl
 - **Server** (`server/`) — Python FastAPI service. Receives agent pushes at `POST /v1/status`, serves the dashboard at `GET /dashboard/<id>`, scans Monad Testnet for FOR Transfer events to compute today's authoritative reward total. Persists daily reward totals + per-hour rounds history to Postgres (or SQLite fallback); in-memory snapshot store for the latest live data per node.
 - **Agent** (`agent/`) — workstation-resident script. Polls the Capsule log for new inference events on a 5 s tick, pushes a snapshot to the bot on each event plus a regular heartbeat. Maintains a rolling 30-day per-hour rounds buffer locally (`agent/rounds-history.json`); the bot mirrors this into Postgres on every push so it survives a workstation reinstall.
 - **Dashboard** (`server/dashboard_html.py`) — single-file HTML+JS, no build step. Reads `node_id` from the URL path, fetches `/v1/dashboard-data?node=<id>` every 5 s, renders the tab strip / cards / chart from one JSON response. Chart.js for the rounds bar chart.
-- **Auth** (`server/login_html.py` + login routes in `app.py`) — optional. Form-based login, signed session cookie via `itsdangerous`, bcrypt verification. Disabled when env vars are unset.
+- **Auth** (`server/login_html.py` + login routes in `app.py`) — mandatory. Form-based login, signed session cookie via `itsdangerous`, bcrypt verification. The server refuses to boot when the env vars are unset.
 
 ---
 
