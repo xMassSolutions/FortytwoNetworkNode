@@ -12,8 +12,7 @@
         <string>{{BOT_URL}}</string>
         <string>--agent-token</string>
         <string>{{AGENT_TOKEN}}</string>
-        <string>--scripts-root</string>
-        <string>{{SCRIPTS_ROOT}}</string>
+        {{SCRIPTS_ARGS}}
         {{EXTRA_ARGS}}
     </array>
     <key>RunAtLoad</key>

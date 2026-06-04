@@ -1,39 +1,42 @@
 #!/usr/bin/env bash
-# Install the FortytwoBot agent as a launchd service on macOS/Linux.
+# Install the FortytwoBot agent as a launchd service on macOS.
 #
 # Usage:
-#   ./install-mac.sh <bot-url> <agent-token> <scripts-root> [docker-container]
+#   ./install-mac.sh <bot-url> <agent-token> [scripts-root] [docker-container]
+#
+# ONE agent per machine. With no <scripts-root> the agent runs in
+# auto-discovery mode: it finds every FortyTwo node on this host and reports
+# each one. Pass <scripts-root> only to pin to a single node (legacy mode; also
+# required for a Docker-container node, given as the 4th arg).
 #
 # After install, the agent runs at user login, restarts on failure, and writes
-# logs to ~/Library/Logs/fortytwo-agent.log (macOS) or ~/.cache/fortytwo-agent.log (Linux).
-#
-# Pass a docker-container name as the 4th arg if the FortyTwo node is running
-# inside a Docker container (the agent will use `docker top` / `docker inspect`
-# instead of pgrep). Leave blank for native installs.
+# logs to ~/Library/Logs/fortytwo-agent.log.
 
 set -euo pipefail
 
-if [[ $# -lt 3 ]]; then
+if [[ $# -lt 2 ]]; then
     cat <<EOF >&2
-Usage: $0 <bot-url> <agent-token> <scripts-root> [docker-container]
+Usage: $0 <bot-url> <agent-token> [scripts-root] [docker-container]
 
-Example (native):
+Example (auto-discovery -- one agent reports every local node; recommended):
+    $0 https://fortytwo-network-node-analysis.onrender.com \$(openssl rand -hex 20)
+
+Example (single node -- pin to one scripts-root):
     $0 https://fortytwo-network-node-analysis.onrender.com \\
         \$(openssl rand -hex 20) \\
         ~/FortytwoCLI/fortytwo-p2p-inference-scripts-main
 
-Example (Docker — pass the container name as the 4th arg):
+Example (Docker single node -- pass the container name as the 4th arg):
     $0 https://fortytwo-network-node-analysis.onrender.com \\
         \$(openssl rand -hex 20) \\
-        ~/fortytwo-data/scripts \\
-        fortytwo-p2p-inference
+        ~/fortytwo-data/scripts fortytwo-p2p-inference
 EOF
     exit 2
 fi
 
 BOT_URL="$1"
 AGENT_TOKEN="$2"
-SCRIPTS_ROOT="$3"
+SCRIPTS_ROOT="${3:-}"
 DOCKER_CONTAINER="${4:-}"
 
 # Resolve script directory
@@ -50,11 +53,16 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Expand scripts-root if it starts with ~
-SCRIPTS_ROOT="${SCRIPTS_ROOT/#\~/$HOME}"
-
-if [[ ! -d "$SCRIPTS_ROOT" ]]; then
-    echo "WARNING: $SCRIPTS_ROOT does not exist. Agent will fail until logs appear there." >&2
+# Build the optional --scripts-root plist arg pair. Empty => auto-discovery.
+MODE="auto-discovery (all local nodes)"
+SCRIPTS_ARGS=""
+if [[ -n "$SCRIPTS_ROOT" ]]; then
+    SCRIPTS_ROOT="${SCRIPTS_ROOT/#\~/$HOME}"   # expand ~
+    if [[ ! -d "$SCRIPTS_ROOT" ]]; then
+        echo "WARNING: $SCRIPTS_ROOT does not exist. Agent will fail until logs appear there." >&2
+    fi
+    SCRIPTS_ARGS="<string>--scripts-root</string><string>$SCRIPTS_ROOT</string>"
+    MODE="single node: $SCRIPTS_ROOT"
 fi
 
 chmod +x "$AGENT"
@@ -96,7 +104,7 @@ sed \
     -e "s|{{AGENT_PATH}}|$AGENT|g" \
     -e "s|{{BOT_URL}}|$BOT_URL|g" \
     -e "s|{{AGENT_TOKEN}}|$AGENT_TOKEN|g" \
-    -e "s|{{SCRIPTS_ROOT}}|$SCRIPTS_ROOT|g" \
+    -e "s|{{SCRIPTS_ARGS}}|$SCRIPTS_ARGS|g" \
     -e "s|{{EXTRA_ARGS}}|$EXTRA_ARGS|g" \
     -e "s|{{LOG_PATH}}|$LOG_PATH|g" \
     "$TEMPLATE" >"$PLIST"
@@ -108,7 +116,7 @@ launchctl load "$PLIST"
 echo "Agent installed:"
 echo "  Plist:       $PLIST"
 echo "  Log:         $LOG_PATH"
-echo "  Scripts:     $SCRIPTS_ROOT"
+echo "  Mode:        $MODE"
 echo "  Bot URL:     $BOT_URL"
 if [[ -n "$DOCKER_CONTAINER" ]]; then
     echo "  Docker:      $DOCKER_CONTAINER (using \`docker top\` for process detection)"
