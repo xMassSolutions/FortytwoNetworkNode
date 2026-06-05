@@ -187,6 +187,21 @@ CREATE TABLE IF NOT EXISTS energy_daily (
 )
 """
 
+# Latest snapshot per node -- a durable mirror of the in-memory store so the
+# dashboard survives a cold start (a server restart, or a fresh serverless
+# invocation): when the in-memory copy is empty, the node's last push is
+# reloaded from here instead of showing "no data". payload = the full Snapshot
+# serialised as JSON (TEXT keeps SQLite + Postgres on the same code path).
+_DDL_NODE_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS node_snapshots (
+    node_id      INTEGER PRIMARY KEY,
+    wallet       TEXT,
+    payload      TEXT NOT NULL,
+    received_at  DOUBLE PRECISION NOT NULL,
+    updated_at   DOUBLE PRECISION NOT NULL
+)
+"""
+
 
 def init_schema() -> None:
     with _lock, get_conn() as conn:
@@ -202,6 +217,55 @@ def init_schema() -> None:
         conn.execute(_DDL_UPTIME_SAMPLES)
         conn.execute(_DDL_ROUNDS)
         conn.execute(_DDL_ENERGY_DAILY)
+        conn.execute(_DDL_NODE_SNAPSHOTS)
+
+
+def upsert_node_snapshot(node_id: int, wallet: str | None, payload_json: str,
+                         received_at: float) -> None:
+    """Persist the latest snapshot for a node (full Snapshot as JSON). Latest
+    wins -- one row per node_id. The caller (store.set) swallows errors so a DB
+    hiccup never drops an agent push."""
+    with _lock, get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO node_snapshots (node_id, wallet, payload, received_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (node_id) DO UPDATE SET
+                wallet      = EXCLUDED.wallet,
+                payload     = EXCLUDED.payload,
+                received_at = EXCLUDED.received_at,
+                updated_at  = EXCLUDED.updated_at
+            """,
+            (node_id, (wallet.lower() if wallet else None), payload_json,
+             received_at, time.time()),
+        )
+
+
+def load_node_snapshot(node_id: int) -> dict | None:
+    """Return {node_id, wallet, payload, received_at} for one node, or None."""
+    with _lock, get_conn() as conn:
+        r = conn.execute(
+            "SELECT node_id, wallet, payload, received_at "
+            "FROM node_snapshots WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+    if not r:
+        return None
+    return {"node_id": r["node_id"], "wallet": r["wallet"],
+            "payload": r["payload"], "received_at": r["received_at"]}
+
+
+def load_all_node_snapshots() -> list[dict]:
+    """Every persisted node snapshot, newest push first."""
+    rows: list[dict] = []
+    with _lock, get_conn() as conn:
+        for r in conn.execute(
+            "SELECT node_id, wallet, payload, received_at "
+            "FROM node_snapshots ORDER BY received_at DESC"
+        ):
+            rows.append({"node_id": r["node_id"], "wallet": r["wallet"],
+                         "payload": r["payload"], "received_at": r["received_at"]})
+    return rows
 
 
 def upsert_daily_total(

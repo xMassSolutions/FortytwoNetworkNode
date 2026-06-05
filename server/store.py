@@ -1,5 +1,8 @@
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+import db
 
 
 @dataclass
@@ -60,21 +63,63 @@ class Snapshot:
 
 
 class Store:
+    """Latest snapshot per node. In-memory for speed (the warm path), with a
+    durable mirror in the DB (`node_snapshots`) so a cold start -- a server
+    restart or a fresh serverless invocation -- reloads the agent's last push
+    instead of showing "no data"."""
+
     def __init__(self) -> None:
         self._latest: dict[int, Snapshot] = {}
 
     def set(self, snap: Snapshot) -> None:
         self._latest[snap.node_id] = snap
+        # Write-through to the durable mirror. Best-effort -- a DB hiccup must
+        # never drop an agent push (the in-memory copy already succeeded).
+        try:
+            db.upsert_node_snapshot(
+                snap.node_id, snap.node_wallet,
+                json.dumps(asdict(snap), separators=(",", ":"), default=str),
+                snap.received_at,
+            )
+        except Exception:
+            pass
 
     def get(self, node_id: int) -> Snapshot | None:
-        return self._latest.get(node_id)
+        s = self._latest.get(node_id)
+        if s is not None:
+            return s
+        # Cold path: rehydrate from the durable mirror and cache it.
+        s = _load_snapshot(node_id)
+        if s is not None:
+            self._latest[node_id] = s
+        return s
 
     def known_node_ids(self) -> list[int]:
-        return sorted(self._latest.keys())
+        ids = set(self._latest.keys())
+        try:
+            ids.update(int(r["node_id"]) for r in db.load_all_node_snapshots())
+        except Exception:
+            pass
+        return sorted(ids)
 
     def wallet_for(self, node_id: int) -> str | None:
-        s = self._latest.get(node_id)
+        s = self.get(node_id)
         return s.node_wallet if s else None
+
+
+_SNAP_FIELDS = set(Snapshot.__dataclass_fields__)
+
+
+def _load_snapshot(node_id: int) -> Snapshot | None:
+    try:
+        row = db.load_node_snapshot(node_id)
+        if not row:
+            return None
+        d = json.loads(row["payload"])
+        # Tolerate schema drift -- only pass keys that are still Snapshot fields.
+        return Snapshot(**{k: v for k, v in d.items() if k in _SNAP_FIELDS})
+    except Exception:
+        return None
 
 
 store = Store()
