@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from itsdangerous import BadSignature, SignatureExpired, TimestampSigner
 from pydantic import BaseModel, Field, field_validator
 
+import cache
 import wallets as wstore
 from chain import get_for_balance, get_native_balance
 from dashboard_html import DASHBOARD_HTML
@@ -168,7 +169,8 @@ _RPC_REQUEST_TIMEOUT = 5.0
 
 async def _cached_balance(wallet: str) -> tuple[float | None, str | None]:
     wlc = wallet.lower()
-    slot = _balance_cache.setdefault(wlc, {"value": None, "error": None, "ts": 0.0})
+    key = "bal:for:" + wlc
+    slot = cache.get_obj(key) or {"value": None, "error": None, "ts": 0.0}
     if time.time() - slot["ts"] < _BALANCE_TTL:
         return slot["value"], slot["error"]
     try:
@@ -176,20 +178,20 @@ async def _cached_balance(wallet: str) -> tuple[float | None, str | None]:
             get_for_balance(MONAD_RPC_URL, FOR_CONTRACT, wallet),
             timeout=_RPC_REQUEST_TIMEOUT,
         )
-        slot.update({"value": v, "error": None, "ts": time.time()})
+        cache.set_obj(key, {"value": v, "error": None, "ts": time.time()})
         return v, None
     except Exception as e:
         msg = "timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
         # Don't overwrite a recent good value with a transient error — keep
         # serving the last-known balance while logging the failure.
-        slot["error"] = msg
-        slot["ts"] = time.time()
+        cache.set_obj(key, {"value": slot["value"], "error": msg, "ts": time.time()})
         return slot["value"], msg
 
 
 async def _cached_monad_balance(wallet: str) -> tuple[float | None, str | None]:
     wlc = wallet.lower()
-    slot = _monad_balance_cache.setdefault(wlc, {"value": None, "error": None, "ts": 0.0})
+    key = "bal:mon:" + wlc
+    slot = cache.get_obj(key) or {"value": None, "error": None, "ts": 0.0}
     if time.time() - slot["ts"] < _BALANCE_TTL:
         return slot["value"], slot["error"]
     try:
@@ -197,12 +199,11 @@ async def _cached_monad_balance(wallet: str) -> tuple[float | None, str | None]:
             get_native_balance(MONAD_RPC_URL, wallet),
             timeout=_RPC_REQUEST_TIMEOUT,
         )
-        slot.update({"value": v, "error": None, "ts": time.time()})
+        cache.set_obj(key, {"value": v, "error": None, "ts": time.time()})
         return v, None
     except Exception as e:
         msg = "timeout" if isinstance(e, asyncio.TimeoutError) else str(e)
-        slot["error"] = msg
-        slot["ts"] = time.time()
+        cache.set_obj(key, {"value": slot["value"], "error": msg, "ts": time.time()})
         return slot["value"], msg
 
 
@@ -224,7 +225,8 @@ async def _cached_node_name(wallet: str | None) -> str | None:
         return None
     wlc = wallet.lower()
     now = time.time()
-    slot = _node_name_cache.get(wlc)
+    key = "name:" + wlc
+    slot = cache.get_obj(key)
     if slot and now - slot["ts"] < (_NODE_NAME_TTL_OK if slot["ok"] else _NODE_NAME_TTL_ERR):
         return slot["name"]
     try:
@@ -240,11 +242,11 @@ async def _cached_node_name(wallet: str | None) -> str | None:
              if str(row.get("original", "")).lower() == wlc),
             (results[0].get("participant") if results else None),
         ) or None
-        _node_name_cache[wlc] = {"name": name, "ts": now, "ok": True}
+        cache.set_obj(key, {"name": name, "ts": now, "ok": True})
         return name
     except Exception as e:
         log.warning("node name fetch failed for %s: %s", wlc, e)
-        _node_name_cache[wlc] = {"name": slot["name"] if slot else None, "ts": now, "ok": False}
+        cache.set_obj(key, {"name": slot["name"] if slot else None, "ts": now, "ok": False})
         return slot["name"] if slot else None
 
 
@@ -326,25 +328,22 @@ def _login_blocked_seconds(ip: str) -> int:
         return 0
     now = time.time()
     cutoff = now - LOGIN_RATE_LIMIT_WINDOW_SECS
-    dq = _login_failures.get(ip)
-    if not dq:
+    fails = [t for t in (cache.get_obj("login:" + ip) or []) if t >= cutoff]
+    if len(fails) < LOGIN_RATE_LIMIT_MAX:
         return 0
-    while dq and dq[0] < cutoff:
-        dq.popleft()
-    if not dq:
-        _login_failures.pop(ip, None)
-        return 0
-    if len(dq) < LOGIN_RATE_LIMIT_MAX:
-        return 0
-    return max(1, int(dq[0] + LOGIN_RATE_LIMIT_WINDOW_SECS - now))
+    return max(1, int(min(fails) + LOGIN_RATE_LIMIT_WINDOW_SECS - now))
 
 
 def _login_record_failure(ip: str) -> None:
-    _login_failures.setdefault(ip, deque()).append(time.time())
+    now = time.time()
+    cutoff = now - LOGIN_RATE_LIMIT_WINDOW_SECS
+    fails = [t for t in (cache.get_obj("login:" + ip) or []) if t >= cutoff]
+    fails.append(now)
+    cache.set_obj("login:" + ip, fails, ttl=LOGIN_RATE_LIMIT_WINDOW_SECS)
 
 
 def _login_record_success(ip: str) -> None:
-    _login_failures.pop(ip, None)
+    cache.delete("login:" + ip)
 
 
 def _active_wallets() -> set[str]:
