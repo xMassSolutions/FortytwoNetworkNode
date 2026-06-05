@@ -95,6 +95,12 @@ LOGIN_RATE_LIMIT_MAX = int(os.environ.get("LOGIN_RATE_LIMIT_MAX", "5"))
 LOGIN_RATE_LIMIT_WINDOW_SECS = int(os.environ.get("LOGIN_RATE_LIMIT_WINDOW_SECS", "900"))
 _login_failures: dict[str, deque] = {}
 
+# Background work runs as in-process loops on an always-on host (Render). On
+# serverless (Vercel) set RUN_BG_LOOPS=0 and drive the same work via Vercel Cron
+# hitting /api/cron/* (authorised by CRON_SECRET) instead.
+RUN_BG_LOOPS = os.environ.get("RUN_BG_LOOPS", "1").lower() not in ("0", "false", "no")
+CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
+
 # Balance caches — at 5s dashboard refresh × N viewers, hitting Monad RPC every
 # request gets us rate-limited. Cache per wallet for 30s. Keyed by lowercased
 # operator wallet so two nodes with distinct wallets each get their own slot.
@@ -357,15 +363,21 @@ def _active_wallets() -> set[str]:
     return wallets
 
 
+async def refresh_all_rewards_once() -> None:
+    """One reward-refresh pass over every active wallet. Shared by the in-process
+    loop (Render) and the /api/cron/refresh-rewards endpoint (Vercel Cron)."""
+    for w in _active_wallets():
+        try:
+            await get_tracker(w).refresh(MONAD_RPC_URL, FOR_CONTRACT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover — defensive
+            log.warning("rewards refresh failed for %s: %s", w, e)
+
+
 async def _background_rewards_refresher() -> None:
     while True:
-        for w in _active_wallets():
-            try:
-                await get_tracker(w).refresh(MONAD_RPC_URL, FOR_CONTRACT)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:  # pragma: no cover — defensive
-                log.warning("rewards refresh failed for %s: %s", w, e)
+        await refresh_all_rewards_once()
         await asyncio.sleep(_BALANCE_TTL)
 
 
@@ -419,50 +431,61 @@ def _uptime_for_node(node_id: int, now: float | None = None) -> dict[str, Any]:
     }
 
 
+def sample_uptime_once() -> None:
+    """One uptime sample + energy accrual per known node. Shared by the
+    in-process loop (Render) and /api/cron/sample-uptime (Vercel Cron)."""
+    now = time.time()
+    # Sample any node we've ever seen. A node's uptime ledger begins at its
+    # first push (a cold store has no snapshots) -- otherwise we'd backfill
+    # "0% for the last 7d" for a node that just came online.
+    for nid in store.known_node_ids():
+        snap = store.get(nid)
+        alive = _is_alive(snap, now)
+        try:
+            insert_uptime_sample(nid, now, alive)
+        except Exception as e:  # pragma: no cover -- defensive
+            log.warning("uptime sample insert failed for node %d: %s", nid, e)
+        # Integrate the node's reported GPU watts over this tick, but only while
+        # it's up AND actually reporting power.
+        if alive and snap is not None and snap.gpu_power_w:
+            try:
+                add_energy(nid, time.strftime("%Y-%m-%d", time.gmtime(now)),
+                           (snap.gpu_power_w + POWER_OVERHEAD_WATTS)
+                           * UPTIME_SAMPLE_INTERVAL_SECS / 3.6e6, now)
+            except Exception as e:  # pragma: no cover -- defensive
+                log.warning("energy accrue failed for node %d: %s", nid, e)
+
+
+def prune_old_data_once() -> None:
+    """Drop uptime samples + energy rows past retention. Hourly from the loop;
+    a daily /api/cron/prune on Vercel."""
+    now = time.time()
+    cutoff = now - UPTIME_RETENTION_DAYS * 24 * 3600.0
+    try:
+        deleted = prune_uptime_samples_older_than(cutoff)
+        if deleted:
+            log.info("pruned %d uptime rows older than %dd", deleted, UPTIME_RETENTION_DAYS)
+    except Exception as e:  # pragma: no cover
+        log.warning("uptime prune failed: %s", e)
+    try:
+        prune_energy_daily_older_than(
+            time.strftime("%Y-%m-%d", time.gmtime(now - 35 * 24 * 3600)))
+    except Exception as e:  # pragma: no cover
+        log.warning("energy prune failed: %s", e)
+
+
 async def _background_uptime_sampler() -> None:
-    """Once per UPTIME_SAMPLE_INTERVAL_SECS, write one (node, ts, alive)
-    row per known node. Prunes rows older than retention every hour."""
+    """In-process driver: sample every UPTIME_SAMPLE_INTERVAL_SECS, prune hourly."""
     if UPTIME_SAMPLE_INTERVAL_SECS <= 0:
         log.info("uptime sampler disabled (UPTIME_SAMPLE_INTERVAL_SECS<=0)")
         return
     last_prune = 0.0
     while True:
         try:
+            sample_uptime_once()
             now = time.time()
-            # Sample any node we've ever seen. Skipping store.known_node_ids()
-            # cold (no snapshots) means a node's uptime ledger begins at its
-            # first push -- which is exactly what we want, otherwise we'd
-            # backfill "0% for the last 7d" for a node that just came online.
-            for nid in store.known_node_ids():
-                snap = store.get(nid)
-                alive = _is_alive(snap, now)
-                try:
-                    insert_uptime_sample(nid, now, alive)
-                except Exception as e:  # pragma: no cover -- defensive
-                    log.warning("uptime sample insert failed for node %d: %s", nid, e)
-                # Accrue energy: integrate the node's reported GPU watts over this
-                # tick, but only while it's up AND actually reporting power.
-                if alive and snap is not None and snap.gpu_power_w:
-                    try:
-                        add_energy(nid, time.strftime("%Y-%m-%d", time.gmtime(now)),
-                                   (snap.gpu_power_w + POWER_OVERHEAD_WATTS)
-                                   * UPTIME_SAMPLE_INTERVAL_SECS / 3.6e6, now)
-                    except Exception as e:  # pragma: no cover -- defensive
-                        log.warning("energy accrue failed for node %d: %s", nid, e)
             if (now - last_prune) >= _UPTIME_PRUNE_EVERY_SECS:
-                cutoff = now - UPTIME_RETENTION_DAYS * 24 * 3600.0
-                try:
-                    deleted = prune_uptime_samples_older_than(cutoff)
-                    if deleted:
-                        log.info("uptime sampler: pruned %d rows older than %dd",
-                                 deleted, UPTIME_RETENTION_DAYS)
-                except Exception as e:  # pragma: no cover
-                    log.warning("uptime prune failed: %s", e)
-                try:
-                    prune_energy_daily_older_than(
-                        time.strftime("%Y-%m-%d", time.gmtime(now - 35 * 24 * 3600)))
-                except Exception as e:  # pragma: no cover
-                    log.warning("energy prune failed: %s", e)
+                prune_old_data_once()
                 last_prune = now
         except asyncio.CancelledError:
             raise
@@ -492,14 +515,20 @@ async def lifespan(_app: FastAPI):
     if not os.environ.get("SESSION_SECRET", "").strip():
         log.warning("SESSION_SECRET unset -- sessions invalidate on every "
                     "restart (set it in Render to make sessions sticky)")
-    refresher = asyncio.create_task(_background_rewards_refresher())
-    sampler = asyncio.create_task(_background_uptime_sampler())
+    # In-process loops on an always-on host. On serverless (RUN_BG_LOOPS=0) the
+    # same work is driven by Vercel Cron -> /api/cron/* instead.
+    tasks: list = []
+    if RUN_BG_LOOPS:
+        tasks = [asyncio.create_task(_background_rewards_refresher()),
+                 asyncio.create_task(_background_uptime_sampler())]
+    else:
+        log.info("RUN_BG_LOOPS=0 -- background work expected via /api/cron/*")
     try:
         yield
     finally:
-        for t in (refresher, sampler):
+        for t in tasks:
             t.cancel()
-        for t in (refresher, sampler):
+        for t in tasks:
             try:
                 await t
             except asyncio.CancelledError:
@@ -507,6 +536,36 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _require_cron_auth(request: Request) -> None:
+    """Vercel Cron sends `Authorization: Bearer $CRON_SECRET`. Reject anything
+    else, and refuse when CRON_SECRET isn't configured."""
+    if not CRON_SECRET:
+        raise HTTPException(status_code=503, detail="cron not configured")
+    if request.headers.get("authorization", "") != f"Bearer {CRON_SECRET}":
+        raise HTTPException(status_code=401, detail="bad cron secret")
+
+
+@app.post("/api/cron/refresh-rewards", include_in_schema=False)
+async def cron_refresh_rewards(request: Request):
+    _require_cron_auth(request)
+    await refresh_all_rewards_once()
+    return {"ok": True}
+
+
+@app.post("/api/cron/sample-uptime", include_in_schema=False)
+async def cron_sample_uptime(request: Request):
+    _require_cron_auth(request)
+    sample_uptime_once()
+    return {"ok": True}
+
+
+@app.post("/api/cron/prune", include_in_schema=False)
+async def cron_prune(request: Request):
+    _require_cron_auth(request)
+    prune_old_data_once()
+    return {"ok": True}
 
 
 class StatusPayload(BaseModel):

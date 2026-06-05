@@ -34,3 +34,30 @@ def test_require_auth_configured_raises_without_creds(monkeypatch):
 def test_require_auth_configured_ok_with_creds(monkeypatch):
     monkeypatch.setattr(app, "AUTH_ENABLED", True)
     app._require_auth_configured()  # configured -> no raise
+
+
+def test_sample_uptime_once_writes_a_row(fresh_db):
+    # The extracted cron-callable samples uptime for every known node.
+    store.set(Snapshot(received_at=time.time(), node_id=3,
+                       node_wallet="0x" + "c" * 40, gpu_power_w=200.0))
+    app.sample_uptime_once()
+    rows = fresh_db.load_uptime_samples_since(3, 0)
+    assert len(rows) >= 1
+
+
+class _Req:  # minimal Request stub for the cron-auth check
+    def __init__(self, auth: str | None):
+        self.headers = {"authorization": auth} if auth else {}
+
+
+def test_cron_auth_rejects_unconfigured_and_wrong_secret(monkeypatch):
+    from fastapi import HTTPException
+    monkeypatch.setattr(app, "CRON_SECRET", "")          # not configured
+    with pytest.raises(HTTPException) as e:
+        app._require_cron_auth(_Req("Bearer x"))
+    assert e.value.status_code == 503
+    monkeypatch.setattr(app, "CRON_SECRET", "s3cr3t")    # wrong token
+    with pytest.raises(HTTPException) as e:
+        app._require_cron_auth(_Req("Bearer nope"))
+    assert e.value.status_code == 401
+    app._require_cron_auth(_Req("Bearer s3cr3t"))         # correct -> no raise
