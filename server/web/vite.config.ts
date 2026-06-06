@@ -1,14 +1,14 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// The SPA is served side-by-side with the legacy dashboard under /app.
-// In dev, proxy the JSON + auth endpoints to the running FastAPI backend
-// (default localhost:8080) so the React app talks to real data.
+// On Vercel the SPA is the whole site (base '/'); the API is reached via the
+// same-origin rewrites in vercel.json. In dev, proxy the JSON + auth endpoints
+// to the running FastAPI backend (default localhost:8080) for real data.
 const API_TARGET = process.env.VITE_API_TARGET || 'http://127.0.0.1:8080'
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: '/app/',
+  base: '/',
   plugins: [react()],
   server: {
     port: 5173,

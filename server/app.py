@@ -547,21 +547,21 @@ def _require_cron_auth(request: Request) -> None:
         raise HTTPException(status_code=401, detail="bad cron secret")
 
 
-@app.post("/api/cron/refresh-rewards", include_in_schema=False)
+@app.get("/api/cron/refresh-rewards", include_in_schema=False)
 async def cron_refresh_rewards(request: Request):
     _require_cron_auth(request)
     await refresh_all_rewards_once()
     return {"ok": True}
 
 
-@app.post("/api/cron/sample-uptime", include_in_schema=False)
+@app.get("/api/cron/sample-uptime", include_in_schema=False)
 async def cron_sample_uptime(request: Request):
     _require_cron_auth(request)
     sample_uptime_once()
     return {"ok": True}
 
 
-@app.post("/api/cron/prune", include_in_schema=False)
+@app.get("/api/cron/prune", include_in_schema=False)
 async def cron_prune(request: Request):
     _require_cron_auth(request)
     prune_old_data_once()

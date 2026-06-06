@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd server/web && npm ci && npm run build",
+  "outputDirectory": "server/web/dist",
+  "rewrites": [
+    { "source": "/v1/:path*", "destination": "/api/index" },
+    { "source": "/login", "destination": "/api/index" },
+    { "source": "/logout", "destination": "/api/index" },
+    { "source": "/healthz", "destination": "/api/index" },
+    { "source": "/api/cron/:path*", "destination": "/api/index" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/cron/refresh-rewards", "schedule": "*/2 * * * *" },
+    { "path": "/api/cron/sample-uptime", "schedule": "* * * * *" },
+    { "path": "/api/cron/prune", "schedule": "30 3 * * *" }
+  ]
+}
