@@ -1,0 +1,11 @@
+.venv
+**/node_modules
+**/__pycache__
+*.pyc
+*.db
+*.log
+.git
+.github
+agent
+fly.toml
+railway.json
